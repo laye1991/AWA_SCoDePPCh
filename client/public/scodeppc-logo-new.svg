@@ -1,0 +1,25 @@
+<svg width="800" height="400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400">
+  <rect width="800" height="400" fill="#004d33"/>
+  <!-- Antilope/Gazelle à gauche -->
+  <path fill="#f1f1f1" d="M230,270 c0,0 -20,-40 -20,-60 c0,-20 10,-40 20,-60 c10,-20 30,-20 40,-10 c10,10 20,30 20,40 c0,10 -10,20 -20,30 c-10,10 -20,20 -20,30 c0,10 10,20 20,20 c10,0 20,-10 30,-20 c10,-10 20,-20 30,-30"/>
+  
+  <!-- Texte SCoDEPPC -->
+  <text x="270" y="240" font-family="Arial" font-size="95" font-weight="bold" fill="#f1f1f1">SCoDEPPC</text>
+  
+  <!-- Cercle avec animaux -->
+  <g transform="translate(700, 220)">
+    <circle cx="0" cy="0" r="80" stroke="#f1f1f1" stroke-width="5" fill="none" />
+    
+    <!-- Lapin -->
+    <path fill="#f1f1f1" d="M-40,-30 Q-35,-40 -30,-30 Q-25,-20 -30,-10 Q-35,0 -40,-10 Q-45,-20 -40,-30" />
+    
+    <!-- Antilope/Gazelle dans le cercle -->
+    <path fill="#f1f1f1" d="M20,-20 Q25,-15 20,-10 Q15,-5 10,-10 Q5,-15 10,-20 Q15,-25 20,-20" />
+    
+    <!-- Cochon/Sanglier -->
+    <path fill="#f1f1f1" d="M-20,20 Q-15,15 -10,20 Q-5,25 -10,30 Q-15,35 -20,30 Q-25,25 -20,20" />
+    
+    <!-- Canard/Oiseau -->
+    <path fill="#f1f1f1" d="M30,20 Q35,15 40,20 Q45,25 40,30 Q35,35 30,30 Q25,25 30,20" />
+  </g>
+</svg>

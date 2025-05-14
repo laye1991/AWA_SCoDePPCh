@@ -1,0 +1,3787 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { db } from "./db";
+import { z } from "zod";
+import { User, hunters, guardians, history } from "@shared/schema";
+import { eq, desc } from "drizzle-orm";
+
+// Étendre l'interface Request pour inclure l'utilisateur
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+
+import {
+  insertHunterSchema,
+  insertPermitSchema,
+  insertTaxSchema,
+  insertHistorySchema,
+  insertUserSchema,
+  insertMessageSchema,
+  insertGroupMessageSchema,
+  insertHuntingGuideSchema,
+  createHuntingGuideWithUserSchema,
+  insertGuardianSchema,
+  insertHuntingCampaignSchema,
+  huntingCampaigns,
+  huntingGuides,
+  taxes
+} from "@shared/schema";
+
+// Middleware d'authentification
+const isAuthenticated = async (req: Request, res: Response, next: NextFunction) => {
+  // Vérifier si l'utilisateur est connecté dans la session ou dans req.user
+  const sessionUser = req.session.user;
+  const currentUser = sessionUser || req.user;
+  
+  if (!currentUser) {
+    console.log("Aucun utilisateur connecté dans le middleware isAuthenticated");
+    return res.status(401).json({ message: "Vous devez être connecté pour accéder à cette ressource" });
+  }
+  
+  // Assigner l'utilisateur à req.user pour les autres middleware
+  req.user = currentUser;
+  
+  next();
+};
+
+// Middleware pour vérifier si l'utilisateur est admin
+const isAdmin = async (req: Request, res: Response, next: NextFunction) => {
+  // Vérifier d'abord que l'utilisateur est authentifié
+  await isAuthenticated(req, res, () => {
+    // Ensuite vérifier si l'utilisateur est un administrateur
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent accéder à cette ressource." });
+    }
+    next();
+  });
+};
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Authentication routes
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      
+      if (!username || !password) {
+        return res.status(400).json({ message: "Le nom d'utilisateur et le mot de passe sont requis" });
+      }
+      
+      // Vérifier d'abord si l'utilisateur existe dans la base de données
+      const userDb = await storage.getUserByUsername(username);
+      
+      if (!userDb) {
+        console.log(`Tentative de connexion avec un nom d'utilisateur inexistant: ${username}`);
+        return res.status(401).json({ message: "Identifiants incorrects" });
+      }
+      
+      // Vérifier si le mot de passe correspond
+      if (userDb.password !== password) {
+        console.log(`Mot de passe incorrect pour l'utilisateur ${username}`);
+        return res.status(401).json({ message: "Identifiants incorrects" });
+      }
+      
+      // Vérifier si le compte est actif
+      if (!userDb.isActive) {
+        return res.status(403).json({ message: "Ce compte a été désactivé. Veuillez contacter un administrateur." });
+      }
+      
+      // Préparer les informations utilisateur (sans le mot de passe)
+      const userInfo = {
+        id: userDb.id,
+        username: userDb.username,
+        email: userDb.email,
+        firstName: userDb.firstName,
+        lastName: userDb.lastName,
+        phone: userDb.phone,
+        matricule: userDb.matricule,
+        serviceLocation: userDb.serviceLocation,
+        assignmentPost: userDb.assignmentPost,
+        region: userDb.region,
+        role: userDb.role,
+        hunterId: userDb.hunterId,
+        isActive: userDb.isActive,
+        createdAt: userDb.createdAt
+      };
+      
+      // Pour les utilisateurs de type chasseur, récupérer également les informations du chasseur
+      if (userDb.role === 'hunter' && userDb.hunterId) {
+        try {
+          const hunterInfo = await storage.getHunter(userDb.hunterId);
+          if (hunterInfo) {
+            // Ajouter les informations du chasseur à la réponse et à l'utilisateur
+            Object.assign(userInfo, {
+              firstName: hunterInfo.firstName,
+              lastName: hunterInfo.lastName,
+              hunter: hunterInfo
+            });
+          }
+        } catch (hunterError) {
+          console.error(`Erreur lors de la récupération des infos du chasseur pour l'utilisateur ${username}:`, hunterError);
+        }
+      }
+      
+      // Stocker l'utilisateur dans la session
+      req.session.user = userInfo;
+      
+      // Enregistrer l'activité de connexion dans l'historique
+      await storage.createHistory({
+        userId: userDb.id,
+        operation: "login",
+        entityType: "user",
+        entityId: userDb.id,
+        details: `Connexion de l'utilisateur ${userDb.username}`
+      });
+      
+      console.log(`Connexion réussie pour l'utilisateur ${username}, rôle: ${userDb.role}`);
+      res.json({ user: userInfo });
+    } catch (error) {
+      console.error("Erreur lors de la connexion:", error);
+      res.status(500).json({ message: "Échec de la connexion" });
+    }
+  });
+  
+  app.post("/api/auth/logout", (req, res) => {
+    // Détruire la session
+    req.session.destroy((err) => {
+      if (err) {
+        console.error("Erreur lors de la destruction de la session:", err);
+        return res.status(500).json({ message: "Erreur lors de la déconnexion" });
+      }
+      res.json({ message: "Déconnexion réussie" });
+    });
+  });
+  
+  app.get("/api/auth/me", async (req, res) => {
+    // Récupérer l'utilisateur de la session
+    const sessionUser = req.session.user;
+    
+    // Si l'utilisateur n'est pas en session, essayer de le récupérer via l'en-tête d'autorisation
+    // comme méthode de secours (pour compatibilité)
+    if (!sessionUser) {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) {
+        return res.json(null);
+      }
+      
+      try {
+        // Extraire l'identifiant (supposons que le format est "Bearer username")
+        const parts = authHeader.split(' ');
+        if (parts.length !== 2 || parts[0] !== 'Bearer') {
+          return res.json(null);
+        }
+        
+        const username = parts[1];
+        
+        // Récupérer l'utilisateur à partir de la base de données
+        const user = await storage.getUserByUsername(username);
+        
+        if (!user) {
+          return res.json(null);
+        }
+        
+        // Ne pas retourner le mot de passe
+        const { password, ...userInfo } = user;
+        
+        // Pour les utilisateurs de type chasseur, récupérer également les informations du chasseur
+        if (user.role === 'hunter' && user.hunterId) {
+          try {
+            const hunterInfo = await storage.getHunter(user.hunterId);
+            if (hunterInfo) {
+              // Ajouter les informations du chasseur à la réponse
+              Object.assign(userInfo, {
+                hunter: hunterInfo,
+                firstName: hunterInfo.firstName,
+                lastName: hunterInfo.lastName
+              });
+            }
+          } catch (hunterError) {
+            console.error(`Erreur lors de la récupération des infos du chasseur pour l'utilisateur ${username}:`, hunterError);
+          }
+        }
+        
+        // Stocker l'utilisateur dans la session pour les prochaines requêtes
+        req.session.user = userInfo as User;
+        
+        return res.json(userInfo);
+      } catch (error) {
+        console.error("Erreur lors de la récupération de l'utilisateur via l'en-tête:", error);
+        return res.json(null);
+      }
+    }
+    
+    // Si l'utilisateur est déjà en session, retourner directement
+    res.json(sessionUser);
+  });
+  
+  // Route pour récupérer tous les utilisateurs
+  app.get("/api/users", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé. Seuls les administrateurs peuvent accéder à cette ressource." });
+      }
+      
+      const allUsers = await storage.getAllUsers();
+      
+      // Retirer le mot de passe des résultats par sécurité
+      const sanitizedUsers = allUsers.map(({ password, ...user }) => user);
+      
+      res.json(sanitizedUsers);
+    } catch (error) {
+      console.error("Erreur lors de la récupération de tous les utilisateurs:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des utilisateurs" });
+    }
+  });
+  
+  // Route pour récupérer tous les guides de chasse
+  app.get("/api/guides", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès non autorisé. Seuls les administrateurs et les agents peuvent accéder à cette ressource." });
+      }
+      
+      // Utiliser la méthode db directement pour récupérer les guides de chasse
+      const guides = await db.select().from(huntingGuides);
+      
+      res.json(guides);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des guides de chasse:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des guides de chasse" });
+    }
+  });
+  
+  // Hunter API routes
+  app.get("/api/hunters", async (req, res) => {
+    try {
+      console.log("Tentative de récupération de tous les chasseurs");
+      const hunters = await storage.getAllHunters();
+      console.log(`${hunters.length} chasseurs trouvés`);
+      res.json(hunters);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs:", error);
+      res.status(500).json({ message: "Failed to retrieve hunters" });
+    }
+  });
+  
+  // Route pour récupérer les utilisateurs par région (utile pour obtenir les agents secteur d'une région)
+  app.get("/api/users/by-region/:region", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur ou un agent régional
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      const region = req.params.region;
+      if (!region) {
+        return res.status(400).json({ message: "Région non spécifiée" });
+      }
+      
+      // Si l'utilisateur est un agent régional, vérifier que la région correspond à sa région
+      if (req.user.role === "agent" && req.user.region && req.user.region !== region) {
+        return res.status(403).json({ message: "Vous n'avez pas accès aux utilisateurs de cette région" });
+      }
+      
+      // Récupérer tous les utilisateurs et filtrer par région
+      const allUsers = await storage.getAllUsers();
+      const usersInRegion = allUsers.filter(user => user.region === region);
+      
+      // Retirer le mot de passe des résultats par sécurité
+      const sanitizedUsers = usersInRegion.map(({ password, ...user }) => user);
+      
+      res.json(sanitizedUsers);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des utilisateurs par région:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des utilisateurs par région" });
+    }
+  });
+  
+  // Route pour récupérer les chasseurs d'une région spécifique
+  app.get("/api/hunters/region/:region", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur, un agent ou un agent secteur
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      const region = req.params.region;
+      if (!region) {
+        return res.status(400).json({ message: "Région non spécifiée" });
+      }
+      
+      // Si l'utilisateur est un agent régional, vérifier que la région correspond à sa région
+      if (req.user.role === "agent" && req.user.region && req.user.region !== region) {
+        return res.status(403).json({ message: "Vous n'avez pas accès aux chasseurs de cette région" });
+      }
+      
+      const hunters = await storage.getHuntersByRegion(region);
+      res.json(hunters);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs par région:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des chasseurs par région" });
+    }
+  });
+  
+  // Route pour récupérer les chasseurs d'une zone spécifique
+  app.get("/api/hunters/zone/:zone", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur, un agent ou un agent secteur
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      const zone = req.params.zone;
+      if (!zone) {
+        return res.status(400).json({ message: "Zone non spécifiée" });
+      }
+      
+      // Si l'utilisateur est un agent secteur, vérifier que la zone correspond à sa zone
+      if (req.user.role === "sub-agent" && req.user.zone && req.user.zone !== zone) {
+        return res.status(403).json({ message: "Vous n'avez pas accès aux chasseurs de cette zone" });
+      }
+      
+      const hunters = await storage.getHuntersByZone(zone);
+      res.json(hunters);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs par zone:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des chasseurs par zone" });
+    }
+  });
+  
+  // Route pour récupérer les informations du chasseur connecté
+  app.get("/api/hunters/me", async (req, res) => {
+    try {
+      // Vérifier si nous avons l'utilisateur dans la session
+      const sessionUser = req.session.user;
+      
+      // Logging pour débogage
+      console.log("Requête /api/hunters/me - User dans la session:", sessionUser);
+      
+      // Si pas d'utilisateur dans la session, essayer req.user (qui est peuplé par le middleware)
+      const currentUser = sessionUser || req.user;
+      
+      if (!currentUser) {
+        console.log("Aucun utilisateur trouvé dans la session ou dans req.user");
+        return res.status(401).json({ message: "Utilisateur non authentifié" });
+      }
+      
+      if (!currentUser.hunterId) {
+        console.log("L'utilisateur n'a pas de hunterId:", currentUser.username);
+        return res.status(404).json({ message: "Aucun chasseur associé à ce compte utilisateur" });
+      }
+      
+      console.log("Recherche du chasseur avec ID:", currentUser.hunterId);
+      const hunter = await storage.getHunter(currentUser.hunterId);
+      
+      if (!hunter) {
+        console.log("Chasseur non trouvé avec l'ID:", currentUser.hunterId);
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+      
+      console.log("Chasseur trouvé:", hunter.lastName, hunter.firstName);
+      res.json(hunter);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du chasseur:", error);
+      res.status(500).json({ message: "Failed to retrieve hunter" });
+    }
+  });
+  
+  // Supprimer la duplication du middleware d'authentification qui a déjà été défini en haut du fichier
+
+  app.get("/api/hunters/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      console.log(`Récupération des détails du chasseur avec ID: ${id}`);
+      const hunter = await storage.getHunter(id);
+      if (!hunter) {
+        console.log(`Aucun chasseur trouvé avec l'ID: ${id}`);
+        return res.status(404).json({ message: "Hunter not found" });
+      }
+      console.log(`Détails du chasseur récupérés:`, hunter);
+      res.json(hunter);
+    } catch (error) {
+      console.error(`Erreur lors de la récupération du chasseur:`, error);
+      res.status(500).json({ message: "Failed to retrieve hunter" });
+    }
+  });
+
+  app.post("/api/hunters", async (req, res) => {
+    try {
+      // Débogage des données reçues
+      console.log("Données reçues pour création de chasseur:", JSON.stringify(req.body, null, 2));
+      
+      // Assurons-nous que le champ phone a une valeur par défaut si null
+      let hunterData = req.body;
+      if (hunterData.phone === null || hunterData.phone === undefined) {
+        hunterData.phone = ""; // Remplace null par une chaîne vide
+      }
+      
+      // S'assurer que nationality est définie si pays est présent
+      if (hunterData.pays && (!hunterData.nationality || hunterData.nationality === "")) {
+        hunterData.nationality = hunterData.pays;
+        console.log("Attribution de la nationalité basée sur le pays:", hunterData.nationality);
+      }
+      
+      // Garder la catégorie telle quelle, puisque nous utilisons maintenant 'touriste'
+      console.log("Catégorie du chasseur:", hunterData.category);
+
+      const validatedData = insertHunterSchema.parse(hunterData);
+
+      // Check if hunter with same ID number exists
+      const existingHunter = await storage.getHunterByIdNumber(validatedData.idNumber);
+      if (existingHunter) {
+        return res.status(400).json({ message: "Chasseur avec ce numéro d'identité existe déjà" });
+      }
+
+      // Ajouter des logs pour diagnostiquer les erreurs
+      console.log("Données de chasseur validées:", validatedData);
+      
+      try {
+        const hunter = await storage.createHunter(validatedData);
+        console.log("Chasseur créé avec succès:", hunter);
+
+        // Préparer un message SMS pour le nouveau chasseur si le numéro de téléphone est fourni
+        if (hunter.phone) {
+          const smsMessage = `Bienvenue sur SIGPE! Votre compte de chasseur a été créé avec succès. Identifiant: ${hunter.idNumber}. Vous pouvez maintenant demander un permis de chasse.`;
+          
+          // Stocker le message dans l'historique pour pouvoir l'envoyer plus tard
+          await storage.createHistory({
+            operation: "sms_notification",
+            entityType: "hunter", 
+            entityId: hunter.id,
+            details: `SMS notification for hunter: ${hunter.lastName} ${hunter.firstName} to phone ${hunter.phone}: ${smsMessage}`
+          });
+          
+          console.log(`SMS notification prepared for new hunter ${hunter.lastName} ${hunter.firstName} to phone ${hunter.phone}`);
+        }
+
+        // Add history record
+        await storage.createHistory({
+          operation: "create",
+          entityType: "hunter",
+          entityId: hunter.id,
+          details: `Created hunter: ${hunter.lastName} ${hunter.firstName}`,
+        });
+
+        res.status(201).json(hunter);
+      } catch (storageError) {
+        console.error("Erreur lors de la création du chasseur dans le stockage:", storageError);
+        throw storageError; // Propager l'erreur pour avoir des détails
+      }
+    } catch (error) {
+      console.error("Erreur détaillée lors de la création du chasseur:", error);
+      
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Données de chasseur invalides", 
+          errors: error.errors 
+        });
+      }
+      
+      res.status(500).json({ 
+        message: "Échec de la création du chasseur",
+        error: error.message || String(error)
+      });
+    }
+  });
+
+  // Route pour mettre à jour uniquement les informations d'équipement du chasseur
+  app.patch("/api/hunters/:id/equipment", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const hunterData = req.body;
+      
+      // Vérifier si l'utilisateur connecté est le propriétaire du profil ou un administrateur
+      const hunter = await storage.getHunter(id);
+      
+      if (!hunter) {
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+      
+      // Vérifier si l'utilisateur a les droits (soit admin soit propriétaire) 
+      if (req.user?.role !== "admin" && req.user?.id !== hunter.userId) {
+        return res.status(403).json({ message: "Vous n'avez pas l'autorisation de modifier ce profil" });
+      }
+      
+      // Ne permettre que la mise à jour des champs d'équipement
+      const equipmentData = {
+        weaponType: hunterData.weaponType,
+        weaponBrand: hunterData.weaponBrand,
+        customWeaponBrand: hunterData.customWeaponBrand,
+        weaponReference: hunterData.weaponReference,
+        weaponCaliber: hunterData.weaponCaliber,
+        weaponOtherDetails: hunterData.weaponOtherDetails
+      };
+      
+      // Mettre à jour uniquement les informations d'équipement
+      await storage.updateHunter(id, equipmentData);
+      
+      res.status(200).json({ message: "Informations d'équipement mises à jour avec succès" });
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour de l'équipement:", error);
+      res.status(500).json({ message: "Erreur lors de la mise à jour de l'équipement" });
+    }
+  });
+
+  app.put("/api/hunters/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      let hunterData = req.body;
+      
+      // Traitement spécial pour la nationalité et le pays
+      if (hunterData.pays && (!hunterData.nationality || hunterData.nationality === "")) {
+        hunterData.nationality = hunterData.pays;
+        console.log("Mise à jour: Attribution de la nationalité basée sur le pays:", hunterData.nationality);
+      }
+      
+      // Garder la catégorie telle quelle, puisque nous utilisons maintenant 'touriste'
+      console.log("Mise à jour: Catégorie du chasseur:", hunterData.category);
+      
+      // Vérification spécifique pour le traitement du statut mineur
+      if (hunterData.isMinor !== undefined) {
+        console.log("Mise à jour du statut mineur du chasseur:", hunterData.isMinor);
+      }
+      
+      const validatedData = insertHunterSchema.partial().parse(hunterData);
+
+      const hunter = await storage.getHunter(id);
+      if (!hunter) {
+        return res.status(404).json({ message: "Hunter not found" });
+      }
+
+      // Check if ID number is changed and if it's already in use
+      if (validatedData.idNumber && validatedData.idNumber !== hunter.idNumber) {
+        const existingHunter = await storage.getHunterByIdNumber(validatedData.idNumber);
+        if (existingHunter && existingHunter.id !== id) {
+          return res.status(400).json({ message: "ID number already in use by another hunter" });
+        }
+      }
+
+      // Ajout du support pour la mise à jour du champ isMinor
+      if (hunterData.isMinor !== undefined) {
+        // Validation du type pour s'assurer que isMinor est un booléen
+        if (typeof hunterData.isMinor !== 'boolean') {
+          return res.status(400).json({ message: "Le champ isMinor doit être un booléen" });
+        }
+        
+        // Utiliser directement la mise à jour via Drizzle pour contourner les restrictions du schéma
+        const { db } = await import("./db");
+        const { hunters } = await import("@shared/schema");
+        const { eq } = await import("drizzle-orm");
+        
+        const result = await db.update(hunters)
+          .set({ isMinor: hunterData.isMinor })
+          .where(eq(hunters.id, id))
+          .returning();
+          
+        if (result.length === 0) {
+          return res.status(500).json({ message: "Échec de la mise à jour du statut mineur du chasseur" });
+        }
+        
+        // Créer une entrée dans l'historique spécifique au changement de statut
+        await storage.createHistory({
+          operation: "update_minor_status",
+          entityType: "hunter",
+          entityId: id,
+          details: `Statut mineur du chasseur modifié: ${hunterData.isMinor ? "Mineur" : "Adulte"}`,
+        });
+        
+        return res.json(result[0]);
+      }
+
+      // Pour les autres mises à jour (qui ne concernent pas le statut mineur)
+      const updatedHunter = await storage.updateHunter(id, validatedData);
+
+      // Add history record
+      await storage.createHistory({
+        operation: "update",
+        entityType: "hunter",
+        entityId: id,
+        details: `Updated hunter: ${updatedHunter!.lastName} ${updatedHunter!.firstName}`,
+      });
+
+      res.json(updatedHunter);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid hunter data", errors: error.errors });
+      }
+      console.error("Erreur lors de la mise à jour du chasseur:", error);
+      res.status(500).json({ message: "Failed to update hunter" });
+    }
+  });
+
+  app.delete("/api/hunters/:id", isAuthenticated, async (req, res) => {
+    try {
+      console.log("📝 Début de la route de suppression du chasseur");
+      
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        console.error("❌ ID de chasseur invalide:", req.params.id);
+        return res.status(400).json({ message: "ID de chasseur invalide" });
+      }
+      
+      // Vérifier si la suppression forcée est demandée
+      const forceDelete = req.query.force === 'true';
+      
+      console.log(`🔍 Tentative de suppression du chasseur avec ID: ${id}, force=${forceDelete}`);
+      console.log(`👤 Utilisateur demandant la suppression: ${req.user?.username} (${req.user?.role})`);
+
+      // Vérifier que l'utilisateur est un admin ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        console.error(`❌ Accès refusé pour l'utilisateur ${req.user?.username} avec le rôle ${req.user?.role}`);
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent supprimer des chasseurs." });
+      }
+
+      const hunter = await storage.getHunter(id);
+      if (!hunter) {
+        console.error(`❌ Chasseur avec ID ${id} non trouvé`);
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+      
+      console.log(`✅ Chasseur trouvé: ${hunter.firstName} ${hunter.lastName}`);
+      
+      // Pour les administrateurs, on force toujours la suppression
+      // Pour les agents, seulement si force=true est spécifié
+      const shouldForce = req.user?.role === 'admin' || forceDelete;
+      
+      console.log(`🔄 Forçage de la suppression? ${shouldForce}`);
+
+      // Appel à la méthode de suppression du chasseur
+      console.log(`🗑️ Appel de la méthode deleteHunter pour l'ID ${id} avec force=${shouldForce}`);
+      const deleted = await storage.deleteHunter(id, shouldForce);
+      
+      if (!deleted) {
+        console.error(`❌ La méthode deleteHunter a retourné false pour l'ID ${id}`);
+        return res.status(500).json({ 
+          message: "Erreur serveur lors de la suppression du chasseur."
+        });
+      }
+      
+      console.log(`✅ Suppression réussie du chasseur ${id}`);
+
+      // Add history record
+      try {
+        console.log(`📝 Ajout d'une entrée d'historique pour la suppression du chasseur ${id}`);
+        await storage.createHistory({
+          userId: req.user?.id,
+          operation: "delete",
+          entityType: "hunter",
+          entityId: id,
+          details: `Chasseur supprimé: ${hunter.lastName} ${hunter.firstName}`,
+        });
+        console.log(`✅ Entrée d'historique créée avec succès`);
+      } catch (historyError) {
+        console.error(`⚠️ Erreur lors de la création de l'entrée d'historique:`, historyError);
+        // On continue malgré l'erreur d'historique
+      }
+
+      console.log(`🎉 Suppression du chasseur ${id} complétée avec succès`);
+      res.status(200).json({ message: "Chasseur supprimé avec succès" });
+    } catch (error) {
+      console.error("❌ Erreur lors de la suppression du chasseur:", error);
+      
+      // Log plus détaillé de l'erreur
+      if (error instanceof Error) {
+        console.error("Type d'erreur:", error.name);
+        console.error("Message d'erreur:", error.message);
+        console.error("Stack trace:", error.stack);
+      }
+      
+      res.status(500).json({ 
+        message: "Échec de la suppression du chasseur",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+  
+  // Route pour suspendre un chasseur
+  app.patch("/api/hunters/:id/suspend", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      // Vérifier que l'utilisateur est un admin ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent suspendre un chasseur." });
+      }
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID chasseur invalide" });
+      }
+      
+      console.log(`🔒 Tentative de suspension du chasseur ${id}`);
+      
+      // Suspendre le chasseur
+      const suspendedHunter = await storage.suspendHunter(id);
+      
+      if (!suspendedHunter) {
+        return res.status(404).json({ message: "Chasseur non trouvé ou impossible à suspendre" });
+      }
+      
+      // Enregistrer l'action dans l'historique
+      try {
+        await storage.createHistory({
+          userId: req.user?.id,
+          operation: "suspend",
+          entityType: "hunter",
+          entityId: id,
+          details: `Chasseur suspendu: ${suspendedHunter.firstName} ${suspendedHunter.lastName} (ID: ${id})`,
+        });
+        console.log(`✅ Entrée d'historique créée`);
+      } catch (historyError) {
+        console.error(`⚠️ Erreur lors de la création de l'entrée d'historique:`, historyError);
+      }
+      
+      return res.json({ 
+        message: "Chasseur suspendu avec succès", 
+        hunter: suspendedHunter 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suspension du chasseur:", error);
+      return res.status(500).json({
+        message: "Échec de la suspension du chasseur",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+  
+  // Route pour réactiver un chasseur
+  app.patch("/api/hunters/:id/reactivate", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      // Vérifier que l'utilisateur est un admin ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent réactiver des chasseurs." });
+      }
+
+      const hunter = await storage.getHunter(id);
+      if (!hunter) {
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+      
+      // Mettre à jour le chasseur pour le marquer comme actif
+      // On met à jour directement dans la base de données avec l'attribut isActive qui existe dans le schéma
+      const result = await db.update(hunters)
+        .set({ isActive: true })
+        .where(eq(hunters.id, id))
+        .returning();
+      
+      const updatedHunter = result[0];
+      
+      if (!updatedHunter) {
+        return res.status(500).json({ message: "Échec de la réactivation du chasseur" });
+      }
+      
+      // Ajouter une entrée dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "reactivate",
+        entityType: "hunter",
+        entityId: id,
+        details: `Chasseur réactivé: ${hunter.lastName} ${hunter.firstName}`,
+      });
+      
+      res.status(200).json({ message: "Chasseur réactivé avec succès", hunter: updatedHunter });
+    } catch (error) {
+      console.error("Erreur lors de la réactivation du chasseur:", error);
+      res.status(500).json({ message: "Échec de la réactivation du chasseur" });
+    }
+  });
+
+  // Route pour vérifier si un ID de chasseur existe
+  app.get("/api/hunters/check-id/:idNumber", async (req, res) => {
+    try {
+      const { idNumber } = req.params;
+      const hunter = await storage.getHunterByIdNumber(idNumber);
+      // Répondre uniquement avec JSON (pas de HTML)
+      res.json({ exists: !!hunter });
+    } catch (error) {
+      console.error("Erreur lors de la vérification de l'ID du chasseur:", error);
+      res.status(500).json({ error: "Erreur lors de la vérification" });
+    }
+  });
+  
+  // Route pour récupérer les chasseurs mineurs
+  app.get("/api/hunters/minors", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul un admin ou agent peut voir les chasseurs mineurs)
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent voir la liste des chasseurs mineurs." });
+      }
+      
+      // Utiliser directement Drizzle pour récupérer les chasseurs avec isMinor = true
+      const { db } = await import("./db");
+      const { hunters } = await import("@shared/schema");
+      const { eq } = await import("drizzle-orm");
+      
+      const minorHunters = await db.select()
+        .from(hunters)
+        .where(eq(hunters.isMinor, true));
+      
+      res.json(minorHunters);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs mineurs:", error);
+      res.status(500).json({ message: "Échec de la récupération des chasseurs mineurs" });
+    }
+  });
+  
+  app.get("/api/hunters/search/idNumber/:idNumber", async (req, res) => {
+    try {
+      const idNumber = req.params.idNumber;
+      const hunter = await storage.getHunterByIdNumber(idNumber);
+      if (!hunter) {
+        return res.status(404).json({ message: "Hunter not found" });
+      }
+      res.json(hunter);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to search hunter" });
+    }
+  });
+
+  app.get("/api/hunters/search/phone/:phone", async (req, res) => {
+    try {
+      const phone = req.params.phone;
+      const hunter = await storage.getHunterByPhone(phone);
+      if (!hunter) {
+        return res.status(404).json({ message: "Hunter not found" });
+      }
+      res.json(hunter);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to search hunter" });
+    }
+  });
+
+  // Les routes API pour les tuteurs des chasseurs mineurs ont été retirées
+  
+  // Les routes pour la gestion des chasseurs mineurs et leurs tuteurs ont été retirées
+
+  // Permit API routes
+  app.get("/api/permits", async (req, res) => {
+    try {
+      const permits = await storage.getAllPermits();
+      res.json(permits);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve permits" });
+    }
+  });
+  
+  // Route pour récupérer tous les permis suspendus
+  app.get("/api/permits/suspended", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent gérer les permis suspendus." });
+      }
+      
+      const suspendedPermits = await storage.getSuspendedPermits();
+      res.json(suspendedPermits);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des permis suspendus:", error);
+      res.status(500).json({ message: "Impossible de récupérer les permis suspendus" });
+    }
+  });
+  
+  // Route pour supprimer tous les permis suspendus en une seule opération
+  app.delete("/api/permits/suspended/all", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent supprimer des permis en masse." });
+      }
+      
+      console.log("Tentative de suppression en masse des permis suspendus");
+      
+      // Récupérer tous les permis suspendus d'abord
+      const suspendedPermits = await storage.getSuspendedPermits();
+      
+      if (suspendedPermits.length === 0) {
+        return res.status(404).json({ message: "Aucun permis suspendu à supprimer" });
+      }
+      
+      const { permits, taxes } = await import("@shared/schema");
+      const { eq } = await import("drizzle-orm");
+      const { db } = await import("./db");
+      
+      let successCount = 0;
+      let failureCount = 0;
+      
+      // Supprimer chaque permis suspendu
+      for (const permit of suspendedPermits) {
+        try {
+          // 1. Supprimer les taxes associées (si elles existent)
+          try {
+            const deletedTaxes = await db.delete(taxes)
+              .where(eq(taxes.permitId, permit.id))
+              .returning();
+            console.log(`Permis ${permit.id}: ${deletedTaxes.length} taxes supprimées`);
+          } catch (taxError) {
+            console.error(`Erreur lors de la suppression des taxes du permis ${permit.id}:`, taxError);
+          }
+          
+          // 2. Supprimer le permis
+          const result = await db.delete(permits)
+            .where(eq(permits.id, permit.id))
+            .returning();
+          
+          if (result.length > 0) {
+            successCount++;
+            // Enregistrer l'action dans l'historique
+            await storage.createHistory({
+              userId: req.user?.id,
+              operation: "delete",
+              entityType: "permit",
+              entityId: permit.id,
+              details: `Permis ${permit.permitNumber} supprimé (suppression de groupe)`
+            });
+          } else {
+            failureCount++;
+          }
+        } catch (permitError) {
+          console.error(`Erreur lors de la suppression du permis ${permit.id}:`, permitError);
+          failureCount++;
+        }
+      }
+      
+      return res.status(200).json({
+        message: `Suppression terminée. ${successCount} permis supprimés, ${failureCount} échecs.`,
+        successCount,
+        failureCount,
+        totalCount: suspendedPermits.length
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suppression en masse des permis suspendus:", error);
+      res.status(500).json({
+        message: "Erreur lors de la suppression en masse des permis",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+  
+  // Route pour supprimer un groupe de permis spécifique par leurs IDs
+  app.delete("/api/permits/batch", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent supprimer des permis en groupe." });
+      }
+      
+      // Vérifier que le corps de la requête contient un tableau d'IDs
+      const permitIds = req.body.permitIds;
+      if (!Array.isArray(permitIds) || permitIds.length === 0) {
+        return res.status(400).json({ message: "La requête doit contenir un tableau non-vide d'IDs de permis" });
+      }
+      
+      console.log(`Tentative de suppression en groupe de ${permitIds.length} permis`);
+      
+      const { permits, taxes } = await import("@shared/schema");
+      const { eq, inArray } = await import("drizzle-orm");
+      const { db } = await import("./db");
+      
+      // Récupérer les informations sur les permis avant de les supprimer
+      const permitsToDelete = await db.select()
+        .from(permits)
+        .where(inArray(permits.id, permitIds));
+      
+      if (permitsToDelete.length === 0) {
+        return res.status(404).json({ message: "Aucun permis trouvé avec les IDs fournis" });
+      }
+      
+      // 1. Supprimer d'abord toutes les taxes associées
+      try {
+        const deletedTaxes = await db.delete(taxes)
+          .where(inArray(taxes.permitId, permitIds))
+          .returning();
+        console.log(`${deletedTaxes.length} taxes supprimées pour le lot de permis`);
+      } catch (taxError) {
+        console.error("Erreur lors de la suppression en groupe des taxes associées:", taxError);
+      }
+      
+      // 2. Supprimer les permis
+      const deletedPermits = await db.delete(permits)
+        .where(inArray(permits.id, permitIds))
+        .returning();
+      
+      // 3. Enregistrer l'action dans l'historique pour chaque permis supprimé
+      for (const permit of permitsToDelete) {
+        try {
+          await storage.createHistory({
+            userId: req.user?.id,
+            operation: "delete",
+            entityType: "permit",
+            entityId: permit.id,
+            details: `Permis ${permit.permitNumber} supprimé (suppression par lot)`
+          });
+        } catch (historyError) {
+          console.error(`Erreur lors de la création de l'historique pour le permis ${permit.id}:`, historyError);
+        }
+      }
+      
+      return res.status(200).json({
+        message: `${deletedPermits.length} permis supprimés avec succès`,
+        deletedCount: deletedPermits.length,
+        totalRequested: permitIds.length
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suppression en groupe des permis:", error);
+      res.status(500).json({
+        message: "Erreur lors de la suppression en groupe des permis",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  app.get("/api/permits/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const permit = await storage.getPermit(id);
+      if (!permit) {
+        return res.status(404).json({ message: "Permit not found" });
+      }
+      res.json(permit);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve permit" });
+    }
+  });
+
+  app.delete("/api/permits/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      console.log("FORCER LA SUPPRESSION - Permis ID:", id);
+      
+      const existingPermit = await storage.getPermit(id);
+      if (!existingPermit) {
+        return res.status(404).json({ message: "Permis non trouvé" });
+      }
+
+      // Utilisation de drizzle directement pour forcer la suppression
+      const { permits, taxes } = await import("@shared/schema");
+      const { eq } = await import("drizzle-orm");
+      const { db } = await import("./db");
+      
+      // 1. Supprimer d'abord toutes les taxes associées (si elles existent)
+      try {
+        const deletedTaxes = await db.delete(taxes)
+          .where(eq(taxes.permitId, id))
+          .returning();
+        console.log(`Suppression forcée: ${deletedTaxes.length} taxes supprimées pour le permis ID ${id}`);
+      } catch (taxError) {
+        console.error("Erreur lors de la suppression des taxes associées (ignorant):", taxError);
+      }
+      
+      // 2. Forcer la suppression du permis
+      const result = await db.delete(permits)
+        .where(eq(permits.id, id))
+        .returning();
+
+      console.log("Résultat de la suppression forcée:", result);
+      
+      if (result.length > 0) {
+        // Créer une entrée d'historique pour la suppression
+        await storage.createHistory({
+          userId: req.user?.id,
+          operation: "delete",
+          entityType: "permit",
+          entityId: id,
+          details: `Permis ${permit.permitNumber} supprimé (FORCE)`
+        });
+        
+        return res.status(200).json({ message: "Permis supprimé avec succès (FORCE)" });
+      } else {
+        return res.status(404).json({ message: "Permis non trouvé ou déjà supprimé" });
+      }
+    } catch (error) {
+      console.error("Error deleting permit:", error);
+      res.status(500).json({ message: "Erreur lors de la suppression du permis" });
+    }
+  });
+
+  app.get("/api/permits/hunter/:hunterId", async (req, res) => {
+    try {
+      const hunterId = parseInt(req.params.hunterId);
+      const permits = await storage.getPermitsByHunterId(hunterId);
+      res.json(permits);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve permits" });
+    }
+  });
+
+  app.get("/api/permits/number/:permitNumber", async (req, res) => {
+    try {
+      const permitNumber = req.params.permitNumber;
+      const permit = await storage.getPermitByNumber(permitNumber);
+      if (!permit) {
+        return res.status(404).json({ message: "Permit not found" });
+      }
+      res.json(permit);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve permit" });
+    }
+  });
+
+  app.post("/api/permits", async (req, res) => {
+    try {
+      console.log("Received permit creation request:", req.body);
+
+      // Check if hunter exists first
+      const hunterId = parseInt(req.body.hunterId);
+      const hunter = await storage.getHunter(hunterId);
+      if (!hunter) {
+        return res.status(400).json({ message: "Chasseur non trouvé" });
+      }
+      
+      // Vérification si le chasseur est suspendu
+      const userRecord = await storage.getUserByHunterId(hunterId);
+      if (userRecord && userRecord.isSuspended) {
+        return res.status(400).json({ message: "Ce chasseur est suspendu et ne peut pas recevoir de nouveaux permis" });
+      }
+
+      // Check if permit number already exists
+      const existingPermit = await storage.getPermitByNumber(req.body.permitNumber);
+      if (existingPermit) {
+        return res.status(400).json({ message: "Ce numéro de permis existe déjà" });
+      }
+      
+      // Vérifier si le chasseur possède déjà un permis du même type
+      const permitType = req.body.type;
+      if (!permitType) {
+        return res.status(400).json({ message: "Le type de permis est obligatoire" });
+      }
+      
+      // Récupérer tous les permis actifs du chasseur
+      const activePermits = await storage.getActivePermitsByHunterId(hunterId);
+      
+      // Vérifier si un permis du même type existe déjà
+      const hasPermitOfSameType = activePermits.some(permit => permit.type === permitType);
+      if (hasPermitOfSameType) {
+        return res.status(400).json({ 
+          message: `Le chasseur possède déjà un permis actif de type '${permitType}'. Un chasseur ne peut avoir qu'un seul permis par type.`
+        });
+      }
+
+      // Validate data with zod schema
+      try {
+        // Récupérer les paramètres de la campagne de chasse pour utiliser la date de fermeture
+        const campaignSettings = await storage.getHuntingCampaignSettings();
+        if (!campaignSettings) {
+          return res.status(500).json({ message: "Impossible de récupérer les paramètres de la campagne de chasse" });
+        }
+        
+        // Calculer la date d'expiration à partir de la date d'émission (1 an)
+        const issueDate = new Date(req.body.issueDate);
+        const oneYearLater = new Date(issueDate);
+        oneYearLater.setFullYear(oneYearLater.getFullYear() + 1);
+        
+        // Si la date de fermeture de la campagne est antérieure à 1 an, utiliser celle-ci
+        const campaignEndDate = new Date(campaignSettings.endDate);
+        const expiryDate = campaignEndDate < oneYearLater ? campaignEndDate : oneYearLater;
+        
+        const validatedData = insertPermitSchema.parse({
+          permitNumber: req.body.permitNumber,
+          hunterId: hunterId,
+          issueDate: req.body.issueDate,
+          // Utiliser la date d'expiration calculée (1 an après émission ou date de fin de campagne au plus tôt)
+          expiryDate: expiryDate.toISOString().split('T')[0],
+          status: "active",
+          price: req.body.price,
+          createdAt: new Date().toISOString().split('T')[0],
+          type: permitType,
+          receiptNumber: req.body.receiptNumber || null,
+          area: req.body.area || null,
+          weapons: req.body.weapons || null
+        });
+
+        console.log("Validated permit data with campaign end date:", validatedData);
+        
+        // Create the permit using validated data
+        const permit = await storage.createPermit(validatedData);
+
+        // Add history record
+        await storage.createHistory({
+          operation: "create",
+          entityType: "permit",
+          entityId: permit.id,
+          details: `Permis créé: ${permit.permitNumber} pour ${hunter.firstName} ${hunter.lastName} (Type: ${permitType})`,
+        });
+
+        console.log("Permit created successfully:", permit);
+        res.status(201).json(permit);
+      } catch (validationError) {
+        console.error("Permit validation error:", validationError);
+        if (validationError instanceof z.ZodError) {
+          return res.status(400).json({ 
+            message: "Erreur de validation des données du permis", 
+            errors: validationError.errors 
+          });
+        }
+        throw validationError;
+      }
+    } catch (error) {
+      console.error("Permit creation error:", error);
+      res.status(500).json({ 
+        message: "Échec de la création du permis",
+        error: error instanceof Error ? error.message : "Erreur inconnue"
+      });
+    }
+  });
+
+  app.patch("/api/permits/:id/renew", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      
+      // Récupérer le permis pour connaître sa date d'expiration actuelle
+      const permit = await storage.getPermit(id);
+      if (!permit) {
+        return res.status(404).json({ message: "Permis non trouvé" });
+      }
+      
+      // Calculer la nouvelle date d'expiration (1 an après la date d'expiration actuelle)
+      const currentExpiry = new Date(permit.expiryDate);
+      const expiryDate = new Date(currentExpiry);
+      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+      
+      // Récupérer également la date de fin de campagne pour s'assurer de ne pas la dépasser
+      const campaignSettings = await storage.getHuntingCampaignSettings();
+      if (campaignSettings) {
+        const campaignEndDate = new Date(campaignSettings.endDate);
+        // Si la date de fin de campagne est antérieure à la nouvelle date d'expiration, utiliser celle-ci
+        if (campaignEndDate < expiryDate) {
+          expiryDate.setTime(campaignEndDate.getTime());
+        }
+      }
+      
+      // Vérifier que le permis existe
+      const existingPermit = await storage.getPermit(id);
+      if (!existingPermit) {
+        return res.status(404).json({ message: "Permis non trouvé" });
+      }
+
+      const renewedPermit = await storage.renewPermit(id, expiryDate);
+
+      // Add history record
+      await storage.createHistory({
+        operation: "renew",
+        entityType: "permit",
+        entityId: id,
+        details: `Permis renouvelé: ${renewedPermit!.permitNumber} jusqu'au ${expiryDate.toISOString().split('T')[0]}`,
+      });
+
+      res.json(renewedPermit);
+    } catch (error) {
+      console.error("Erreur lors du renouvellement du permis:", error);
+      res.status(500).json({ message: "Échec du renouvellement du permis" });
+    }
+  });
+
+  app.patch("/api/permits/:id/suspend", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      console.log("FORCER LA SUSPENSION - Permis ID:", id);
+
+      // Utilisation de drizzle directement pour forcer la mise à jour
+      const { permits } = await import("@shared/schema");
+      const { eq } = await import("drizzle-orm");
+      const { db } = await import("./db");
+      
+      // Forcer la mise à jour sans vérification
+      const result = await db.update(permits)
+        .set({ status: 'suspended' })
+        .where(eq(permits.id, id))
+        .returning();
+
+      if (!result || result.length === 0) {
+        return res.status(404).json({ message: "Permis non trouvé ou suspension impossible" });
+      }
+      
+      const suspendedPermit = result[0];
+      console.log("Suspension forcée réussie:", suspendedPermit);
+
+      // Add history record
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "suspend",
+        entityType: "permit",
+        entityId: id,
+        details: `Permis suspendu (force): ${suspendedPermit.permitNumber}`,
+      });
+
+      return res.json(suspendedPermit);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("Erreur lors de la suspension forcée du permis:", errorMessage);
+      return res.status(500).json({ 
+        message: "Échec de la suspension du permis",
+        error: errorMessage
+      });
+    }
+  });
+  
+  // Endpoint pour l'évolution d'un permis de Petite Chasse vers Grande Chasse
+  app.patch("/api/permits/:id/upgrade", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul un admin ou un agent peut faire évoluer un permis)
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent faire évoluer un permis." });
+      }
+      
+      const id = parseInt(req.params.id);
+      
+      // Validation des données de la requête
+      const upgradeDataSchema = z.object({
+        additionalPrice: z.number().min(0, "Le prix supplémentaire doit être positif ou nul"),
+        newType: z.enum(["Grande Chasse"], { errorMap: () => ({ message: "Le type doit être 'Grande Chasse'" })})
+      });
+      
+      // Valider les données de la requête
+      const { additionalPrice, newType } = upgradeDataSchema.parse(req.body);
+      
+      // Vérifier que le permis existe
+      const permit = await storage.getPermit(id);
+      if (!permit) {
+        return res.status(404).json({ message: "Permis non trouvé" });
+      }
+      
+      // Vérifier que le permis est de type Petite Chasse
+      if (permit.type !== "Petite Chasse") {
+        return res.status(400).json({ 
+          message: "Seuls les permis de type 'Petite Chasse' peuvent évoluer vers 'Grande Chasse'" 
+        });
+      }
+      
+      // Vérifier que le permis est actif
+      if (permit.status !== "active") {
+        return res.status(400).json({ 
+          message: "Seuls les permis actifs peuvent être mis à jour" 
+        });
+      }
+      
+      // Récupérer les informations du chasseur
+      const hunter = await storage.getHunter(permit.hunterId);
+      if (!hunter) {
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+      
+      // Vérifier que le chasseur n'a pas déjà un permis de Grande Chasse
+      const allPermits = await storage.getActivePermitsByHunterId(permit.hunterId);
+      const hasGrandeChasse = allPermits.some(p => p.type === "Grande Chasse" && p.id !== id);
+      
+      if (hasGrandeChasse) {
+        return res.status(400).json({ 
+          message: "Le chasseur possède déjà un permis de Grande Chasse actif" 
+        });
+      }
+      
+      // Faire évoluer le permis
+      const upgradedPermit = await storage.upgradePermit(id, newType, additionalPrice);
+      
+      if (!upgradedPermit) {
+        return res.status(500).json({ message: "Erreur lors de la mise à jour du permis" });
+      }
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "upgrade",
+        entityType: "permit",
+        entityId: id,
+        details: `Évolution du permis ${permit.permitNumber} de '${permit.type}' vers '${newType}' pour ${hunter.firstName} ${hunter.lastName}. Prix supplémentaire: ${additionalPrice}`
+      });
+      
+      res.status(200).json({
+        message: "Permis mis à jour avec succès",
+        permit: upgradedPermit
+      });
+    } catch (error) {
+      console.error("Erreur lors de l'évolution du permis:", error);
+      
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Données invalides pour l'évolution du permis",
+          errors: error.errors
+        });
+      }
+      
+      res.status(500).json({ 
+        message: "Échec de l'évolution du permis",
+        error: error instanceof Error ? error.message : "Erreur inconnue"
+      });
+    }
+  });
+
+  // Route pour supprimer un groupe de permis spécifiques par leurs IDs
+  app.post("/api/permits/batch/delete", isAuthenticated, async (req, res) => {
+    try {
+      const { permitIds } = req.body;
+      
+      if (!permitIds || !Array.isArray(permitIds) || permitIds.length === 0) {
+        return res.status(400).json({ message: "Veuillez fournir un tableau d'identifiants de permis à supprimer" });
+      }
+      
+      console.log(`Tentative de suppression de ${permitIds.length} permis:`, permitIds);
+      
+      // Vérifier que l'utilisateur a les autorisations nécessaires
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et agents peuvent supprimer des permis." });
+      }
+      
+      const { permits, taxes } = await import("@shared/schema");
+      const { eq, inArray } = await import("drizzle-orm");
+      const { db } = await import("./db");
+      
+      let successCount = 0;
+      let failureCount = 0;
+      
+      // Récupérer d'abord les détails des permis pour l'historique
+      const permitsToDelete = await db.select().from(permits)
+        .where(inArray(permits.id, permitIds));
+      
+      if (permitsToDelete.length === 0) {
+        return res.status(404).json({ message: "Aucun des permis spécifiés n'a été trouvé" });
+      }
+      
+      // Supprimer les taxes associées d'abord
+      try {
+        await db.delete(taxes)
+          .where(inArray(taxes.permitId, permitIds));
+      } catch (taxError) {
+        console.error(`Erreur lors de la suppression des taxes associées:`, taxError);
+      }
+      
+      // Supprimer les permis
+      try {
+        const result = await db.delete(permits)
+          .where(inArray(permits.id, permitIds))
+          .returning();
+        
+        successCount = result.length;
+        failureCount = permitIds.length - successCount;
+        
+        // Enregistrer l'action dans l'historique pour chaque permis supprimé
+        for (const permit of permitsToDelete) {
+          try {
+            await storage.createHistory({
+              userId: req.user?.id,
+              operation: "delete",
+              entityType: "permit",
+              entityId: permit.id,
+              details: `Permis ${permit.permitNumber} supprimé (suppression en lot)`
+            });
+          } catch (historyError) {
+            console.error(`Erreur lors de l'enregistrement de l'historique pour le permis ${permit.id}:`, historyError);
+          }
+        }
+      } catch (deleteError) {
+        console.error("Erreur lors de la suppression des permis:", deleteError);
+        return res.status(500).json({
+          message: "Erreur lors de la suppression des permis",
+          error: deleteError instanceof Error ? deleteError.message : String(deleteError)
+        });
+      }
+      
+      return res.status(200).json({
+        message: `Suppression terminée. ${successCount} permis supprimés, ${failureCount} échecs.`,
+        successCount,
+        failureCount,
+        totalCount: permitIds.length
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suppression en lot des permis:", error);
+      res.status(500).json({
+        message: "Erreur lors de la suppression en lot des permis",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  // Tax API routes
+  app.get("/api/taxes", async (req, res) => {
+    try {
+      const taxes = await storage.getAllTaxes();
+      res.json(taxes);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve taxes" });
+    }
+  });
+
+  app.get("/api/taxes/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const tax = await storage.getTax(id);
+      if (!tax) {
+        return res.status(404).json({ message: "Tax not found" });
+      }
+      res.json(tax);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve tax" });
+    }
+  });
+
+  app.get("/api/taxes/hunter/:hunterId", async (req, res) => {
+    try {
+      const hunterId = parseInt(req.params.hunterId);
+      const taxes = await storage.getTaxesByHunterId(hunterId);
+      res.json(taxes);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve taxes" });
+    }
+  });
+
+  app.post("/api/taxes", async (req, res) => {
+    try {
+      const validatedData = insertTaxSchema.parse(req.body);
+
+      // Check if hunter exists
+      const hunter = await storage.getHunter(validatedData.hunterId);
+      if (!hunter) {
+        return res.status(400).json({ message: "Hunter not found" });
+      }
+
+      // Check if permit exists
+      const permit = await storage.getPermit(validatedData.permitId);
+      if (!permit) {
+        return res.status(400).json({ message: "Permis non trouvé" });
+      }
+
+      // Ensure permit is active
+      if (permit.status !== 'active') {
+        return res.status(400).json({ message: "Le permis n'est pas actif" });
+      }
+
+      const tax = await storage.createTax(validatedData);
+
+      // Add history record
+      await storage.createHistory({
+        operation: "create",
+        entityType: "tax",
+        entityId: tax.id,
+        details: `Created tax: ${tax.taxNumber} for hunter ID ${hunter.id}`,
+      });
+
+      res.status(201).json(tax);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid tax data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create tax" });
+    }
+  });
+
+  // History API routes
+  app.get("/api/history", async (req, res) => {
+    try {
+      const history = await storage.getAllHistory();
+      res.json(history);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve history" });
+    }
+  });
+
+  app.get("/api/history/:entityType/:entityId", async (req, res) => {
+    try {
+      const entityType = req.params.entityType;
+      const entityId = parseInt(req.params.entityId);
+      const history = await storage.getHistoryByEntityId(entityId, entityType);
+      res.json(history);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to retrieve history" });
+    }
+  });
+
+  app.post("/api/history/clear", async (req, res) => {
+    try {
+      await storage.clearHistory();
+
+      // Créer une nouvelle entrée d'historique pour enregistrer l'effacement
+      await storage.createHistory({
+        operation: "delete",
+        entityType: "system",
+        entityId: 0,
+        details: "Historique effacé par l'administrateur",
+      });
+
+      res.status(200).json({ message: "L'historique a été effacé avec succès" });
+    } catch (error) {
+      console.error("Error clearing history:", error);
+      res.status(500).json({ message: "Échec de l'effacement de l'historique" });
+    }
+  });
+
+  // Route pour récupérer tous les agents (uniquement les utilisateurs avec rôle agent)
+  app.get("/api/users/agents", async (req, res) => {
+    try {
+      // Récupérer tous les utilisateurs
+      const users = await storage.getAllUsers();
+      
+      // Filtrer pour ne garder que les agents
+      const agents = users.filter(user => user.role === "agent");
+      
+      // Supprimer les mots de passe avant de renvoyer la réponse
+      const agentsWithoutPassword = agents.map(agent => {
+        const { password, ...agentWithoutPassword } = agent;
+        return agentWithoutPassword;
+      });
+      
+      return res.json(agentsWithoutPassword);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des agents:", error);
+      return res.status(500).json({ message: "Échec de la récupération des agents" });
+    }
+  });
+
+  // Revenue management
+  app.post("/api/revenues/clear", async (req, res) => {
+    try {
+      await storage.clearRevenues();
+
+      // Créer une nouvelle entrée d'historique pour enregistrer l'effacement des recettes
+      await storage.createHistory({
+        operation: "delete",
+        entityType: "revenue",
+        entityId: 0,
+        details: "Recettes effacées par l'administrateur",
+      });
+
+      res.status(200).json({ message: "Les recettes ont été effacées avec succès" });
+    } catch (error) {
+      console.error("Error clearing revenues:", error);
+      res.status(500).json({ message: "Échec de l'effacement des recettes" });
+    }
+  });
+
+  // Stats API route
+  let statsCache = {
+    data: null,
+    timestamp: 0
+  };
+
+  app.get("/api/stats", async (req, res) => {
+    try {
+      const now = Date.now();
+      // Cache valide pendant 25 secondes
+      if (statsCache.data && now - statsCache.timestamp < 25000) {
+        return res.json(statsCache.data);
+      }
+
+      const stats = await storage.getStats();
+      
+      // Ajouter les informations de la campagne en cours
+      const campaignSettings = await storage.getHuntingCampaignSettings();
+      
+      const fullStats = {
+        ...stats,
+        campaignSettings
+      };
+      
+      statsCache = {
+        data: fullStats,
+        timestamp: now
+      };
+      
+      res.json(fullStats);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des statistiques:", error);
+      res.status(500).json({ message: "Failed to retrieve stats" });
+    }
+  });
+
+  // Stats pour graphiques
+  app.get("/api/stats/permits-by-month", async (req, res) => {
+    try {
+      const permitsByMonth = await storage.getPermitsByMonth();
+      res.json(permitsByMonth);
+    } catch (error) {
+      console.error("Error retrieving permits by month:", error);
+      res.status(500).json({ message: "Failed to retrieve permits by month statistics" });
+    }
+  });
+  
+  // Endpoint pour récupérer l'historique des activités
+  app.get("/api/history", isAuthenticated, async (req, res) => {
+    try {
+      // Récupérer l'historique depuis la base de données
+      const historyData = await db.select().from(history).orderBy(desc(history.createdAt));
+      return res.json(historyData);
+    } catch (error) {
+      console.error("Erreur lors de la récupération de l'historique:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Endpoint pour effacer l'historique (option réservée aux administrateurs)
+  app.post("/api/history/clear", isAuthenticated, async (req, res) => {
+    // Vérifier que l'utilisateur est un administrateur
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent effacer l'historique." });
+    }
+    try {
+      // Dans une implementation réelle, ceci supprimerait ou archiverait les données
+      // Pour l'exemple, nous retournons simplement un message de succès
+      return res.json({ message: "L'historique a été effacé avec succès" });
+    } catch (error) {
+      console.error("Erreur lors de la suppression de l'historique:", error);
+      return res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+  
+  // Endpoints pour les demandes de permis
+  app.post("/api/permit-requests", async (req, res) => {
+    try {
+      const permitRequest = await storage.createPermitRequest(req.body);
+      
+      // Créer une entrée dans l'historique
+      await storage.createHistory({
+        entityId: permitRequest.id,
+        entityType: "permit_request",
+        operation: "create",
+        userId: req.body.userId,
+        details: `Nouvelle demande de permis de chasse créée`
+      });
+      
+      res.status(201).json(permitRequest);
+    } catch (error) {
+      console.error("Error creating permit request:", error);
+      res.status(500).json({ message: "Erreur lors de la création de la demande de permis" });
+    }
+  });
+
+  // Obtenir les permis actifs d'un chasseur
+  app.get("/api/permits/hunter/:id/active", async (req, res) => {
+    try {
+      const hunterId = parseInt(req.params.id);
+      
+      if (isNaN(hunterId)) {
+        return res.status(400).json({ message: "ID de chasseur invalide" });
+      }
+      
+      const permits = await storage.getActivePermitsByHunterId(hunterId);
+      res.json(permits);
+    } catch (error) {
+      console.error("Error retrieving active permits:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des permis actifs" });
+    }
+  });
+
+  app.get("/api/stats/revenue-by-type", async (req, res) => {
+    try {
+      const revenueStats = await storage.getRevenueByType();
+      res.json(revenueStats);
+    } catch (error) {
+      console.error("Error retrieving revenue by type:", error);
+      res.status(500).json({ message: "Failed to retrieve revenue statistics" });
+    }
+  });
+
+  app.get("/api/stats/tax-distribution", async (req, res) => {
+    try {
+      const taxStats = await storage.getTaxDistribution();
+      res.json(taxStats);
+    } catch (error) {
+      console.error("Error retrieving tax distribution:", error);
+      res.status(500).json({ message: "Failed to retrieve tax distribution statistics" });
+    }
+  });
+
+  // Routes pour gérer les campagnes cynégétiques
+  app.get("/api/huntingCampaign", async (req, res) => {
+    try {
+      const campaignSettings = await storage.getHuntingCampaignSettings();
+      res.json(campaignSettings);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des paramètres de campagne:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des paramètres de campagne" });
+    }
+  });
+  
+  app.post("/api/huntingCampaign", isAdmin, async (req, res) => {
+    try {
+      const { startDate, endDate, year, isActive } = req.body;
+      
+      if (!startDate || !endDate || !year) {
+        return res.status(400).json({ message: "Les dates de début et de fin ainsi que l'année sont requises" });
+      }
+      
+      const savedSettings = await storage.saveHuntingCampaignSettings({
+        startDate,
+        endDate,
+        year,
+        isActive
+      });
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id || 0,
+        operation: "update",
+        entityType: "hunting_campaign",
+        entityId: 0, // ID fictif car nous utilisons la dernière campagne
+        details: `Mise à jour des paramètres de campagne cynégétique ${year} (${new Date(startDate).toLocaleDateString()} - ${new Date(endDate).toLocaleDateString()})`
+      });
+      
+      res.json(savedSettings);
+    } catch (error) {
+      console.error("Erreur lors de la sauvegarde des paramètres de campagne:", error);
+      res.status(500).json({ message: "Erreur lors de la sauvegarde des paramètres de campagne" });
+    }
+  });
+
+  // ID Sequencing API routes
+  app.get("/api/sequence/:table/next", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin ou un agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs et les agents peuvent accéder à cette ressource." });
+      }
+      
+      const tableName = req.params.table;
+      // Liste des tables autorisées
+      const allowedTables = ['hunters', 'permits', 'taxes', 'hunting_reports', 'hunting_guides'];
+      
+      if (!allowedTables.includes(tableName)) {
+        return res.status(400).json({ message: "Table non autorisée pour la gestion des séquences." });
+      }
+      
+      // Vérifier si la méthode getNextAvailableId existe sur storage
+      if (typeof storage.getNextAvailableId !== 'function') {
+        console.error("Méthode getNextAvailableId non implémentée");
+        return res.status(500).json({ message: "Fonctionnalité en cours d'implémentation" });
+      }
+      
+      const nextId = await storage.getNextAvailableId(tableName);
+      res.json({ table: tableName, nextId });
+    } catch (error) {
+      console.error(`Erreur lors de la récupération du prochain ID pour ${req.params.table}:`, error);
+      res.status(500).json({ message: "Échec de la récupération du prochain ID." });
+    }
+  });
+  
+  app.post("/api/sequence/:table/resequence", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent réorganiser les séquences d'ID." });
+      }
+      
+      const tableName = req.params.table;
+      // Liste des tables autorisées
+      const allowedTables = ['hunters', 'permits', 'taxes', 'hunting_reports', 'hunting_guides'];
+      
+      if (!allowedTables.includes(tableName)) {
+        return res.status(400).json({ message: "Table non autorisée pour la réorganisation des séquences." });
+      }
+      
+      // Vérifier si la méthode resequenceIds existe sur storage
+      if (typeof storage.resequenceIds !== 'function') {
+        console.error("Méthode resequenceIds non implémentée");
+        return res.status(500).json({ message: "Fonctionnalité en cours d'implémentation" });
+      }
+      
+      await storage.resequenceIds(tableName);
+      
+      // Ajouter une entrée à l'historique
+      await storage.createHistory({
+        userId: req.user.id,
+        operation: "resequence",
+        entityType: "table",
+        entityId: 0, // Pas d'ID spécifique pour cette opération
+        details: `Réorganisation des IDs de la table ${tableName}`
+      });
+      
+      res.json({ message: `Séquence d'IDs de la table ${tableName} réorganisée avec succès.` });
+    } catch (error) {
+      console.error(`Erreur lors de la réorganisation des IDs pour ${req.params.table}:`, error);
+      res.status(500).json({ message: "Échec de la réorganisation des IDs." });
+    }
+  });
+  
+  // Messages API routes (pour la messagerie interne)
+  app.get("/api/messages", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user!.id;
+      
+      // Vérifier si la méthode getMessageThreads existe sur storage
+      if (typeof storage.getMessageThreads !== 'function') {
+        console.error("Méthode getMessageThreads non implémentée");
+        return res.status(500).json({ message: "Fonctionnalité en cours d'implémentation" });
+      }
+      
+      const threads = await storage.getMessageThreads(userId);
+      res.json(threads);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des messages:", error);
+      res.status(500).json({ message: "Échec de la récupération des messages" });
+    }
+  });
+  
+  app.get("/api/messages/:id", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const message = await storage.getMessageWithSender(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Message non trouvé" });
+      }
+      
+      // Vérifier que l'utilisateur a accès à ce message
+      const userId = req.user!.id;
+      if (message.senderId !== userId && message.recipientId !== userId) {
+        return res.status(403).json({ message: "Vous n'avez pas accès à ce message" });
+      }
+      
+      // Si l'utilisateur est le destinataire et que le message n'est pas encore lu, le marquer comme lu
+      if (message.recipientId === userId && !message.isRead) {
+        await storage.markMessageAsRead(messageId);
+      }
+      
+      res.json(message);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du message:", error);
+      res.status(500).json({ message: "Échec de la récupération du message" });
+    }
+  });
+  
+  app.get("/api/messages/thread/:id", isAuthenticated, async (req, res) => {
+    try {
+      const threadId = parseInt(req.params.id);
+      if (isNaN(threadId)) {
+        return res.status(400).json({ message: "ID de conversation invalide" });
+      }
+      
+      const thread = await storage.getMessageThread(threadId);
+      if (!thread || thread.length === 0) {
+        return res.status(404).json({ message: "Conversation non trouvée" });
+      }
+      
+      // Vérifier que l'utilisateur a accès à cette conversation
+      const userId = req.user!.id;
+      const parentMessage = thread[0]; // Le premier message est le parent
+      
+      if (parentMessage.senderId !== userId && parentMessage.recipientId !== userId) {
+        return res.status(403).json({ message: "Vous n'avez pas accès à cette conversation" });
+      }
+      
+      // Marquer tous les messages non lus comme lus si l'utilisateur est le destinataire
+      for (const message of thread) {
+        if (message.recipientId === userId && !message.isRead) {
+          await storage.markMessageAsRead(message.id);
+        }
+      }
+      
+      res.json(thread);
+    } catch (error) {
+      console.error("Erreur lors de la récupération de la conversation:", error);
+      res.status(500).json({ message: "Échec de la récupération de la conversation" });
+    }
+  });
+  
+  app.post("/api/messages", isAuthenticated, async (req, res) => {
+    try {
+      const validatedData = insertMessageSchema.parse(req.body);
+      
+      // Vérifier que l'expéditeur est bien l'utilisateur connecté
+      if (validatedData.senderId !== req.user!.id) {
+        return res.status(403).json({ message: "Vous ne pouvez pas envoyer des messages au nom d'un autre utilisateur" });
+      }
+      
+      // Vérifier que le destinataire existe
+      const recipient = await storage.getUser(validatedData.recipientId);
+      if (!recipient) {
+        return res.status(404).json({ message: "Destinataire non trouvé" });
+      }
+      
+      const message = await storage.createMessage(validatedData);
+      
+      // Ajouter une entrée à l'historique
+      await storage.createHistory({
+        userId: req.user!.id,
+        operation: "create",
+        entityType: "message",
+        entityId: message.id,
+        details: `Message envoyé à ${recipient.username}`
+      });
+      
+      res.status(201).json(message);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Données de message invalides", errors: error.errors });
+      }
+      console.error("Erreur lors de la création du message:", error);
+      res.status(500).json({ message: "Échec de la création du message" });
+    }
+  });
+  
+  app.put("/api/messages/:id/read", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const message = await storage.getMessage(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Message non trouvé" });
+      }
+      
+      // Vérifier que l'utilisateur est bien le destinataire
+      if (message.recipientId !== req.user!.id) {
+        return res.status(403).json({ message: "Vous ne pouvez pas marquer comme lu un message dont vous n'êtes pas le destinataire" });
+      }
+      
+      const updatedMessage = await storage.markMessageAsRead(messageId);
+      res.json(updatedMessage);
+    } catch (error) {
+      console.error("Erreur lors du marquage du message comme lu:", error);
+      res.status(500).json({ message: "Échec du marquage du message comme lu" });
+    }
+  });
+  
+  app.delete("/api/messages/:id", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const message = await storage.getMessage(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Message non trouvé" });
+      }
+      
+      // Vérifier les permissions utilisateur
+      const userId = req.user!.id;
+      const userRole = req.user!.role;
+      const isSender = message.senderId === userId;
+      const isRecipient = message.recipientId === userId;
+      const isAgent = userRole === 'agent' || userRole === 'sub-agent';
+      const isAdmin = userRole === 'admin';
+      
+      // Permission de suppression:
+      // - Administrateurs peuvent supprimer tous les messages
+      // - Agents peuvent supprimer tous les messages qu'ils ont reçus ou envoyés
+      // - Chasseurs peuvent supprimer uniquement les messages dont ils sont expéditeurs ou destinataires
+      if (!isAdmin && !isAgent && !isSender && !isRecipient) {
+        return res.status(403).json({ 
+          message: "Vous n'avez pas les droits pour supprimer ce message" 
+        });
+      }
+      
+      // Pour l'admin et les agents, on supprime directement le message
+      if (isAdmin) {
+        await storage.deleteMessage(messageId);
+        
+        // Enregistrer dans l'historique
+        await storage.createHistory({
+          userId: req.user!.id,
+          operation: "delete",
+          entityType: "message",
+          entityId: messageId,
+          details: `Suppression administrative d'un message`
+        });
+        
+        return res.json({ message: "Message supprimé définitivement par l'administrateur" });
+      } 
+      else if (isAgent) {
+        // Marquer comme supprimé avec le flag correspondant
+        if (isSender) {
+          await storage.markMessageAsDeleted(messageId, true);
+        } else {
+          await storage.markMessageAsDeleted(messageId, false);
+        }
+        
+        // Si les deux parties ont supprimé le message, le supprimer définitivement
+        const updatedMessage = await storage.getMessage(messageId);
+        if (updatedMessage && (updatedMessage.isDeletedBySender && updatedMessage.isDeleted)) {
+          await storage.deleteMessage(messageId);
+          return res.json({ message: "Message supprimé définitivement" });
+        }
+        
+        return res.json({ message: "Message supprimé avec succès" });
+      } 
+      else {
+        // Pour les chasseurs et autres rôles: comportement standard
+        await storage.markMessageAsDeleted(messageId, isSender);
+        
+        // Si les deux parties ont supprimé le message, le supprimer définitivement
+        if ((isSender && message.isDeleted) || (isRecipient && message.isDeletedBySender)) {
+          await storage.deleteMessage(messageId);
+        }
+        
+        return res.json({ message: "Message supprimé avec succès" });
+      }
+    } catch (error) {
+      console.error("Erreur lors de la suppression du message:", error);
+      res.status(500).json({ message: "Échec de la suppression du message" });
+    }
+  });
+  
+  // Routes pour les messages groupés
+  app.get("/api/group-messages", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user!.id;
+      
+      // Vérifier si la méthode getGroupMessagesByUser existe sur storage
+      if (typeof storage.getGroupMessagesByUser !== 'function') {
+        console.error("Méthode getGroupMessagesByUser non implémentée");
+        return res.status(500).json({ message: "Fonctionnalité en cours d'implémentation" });
+      }
+      
+      const messages = await storage.getGroupMessagesByUser(userId);
+      res.json(messages);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des messages de groupe:", error);
+      res.status(500).json({ message: "Échec de la récupération des messages de groupe" });
+    }
+  });
+  
+  app.get("/api/group-messages/:id", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const message = await storage.getGroupMessageWithSender(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Message non trouvé" });
+      }
+      
+      // Vérifier que l'utilisateur a accès à ce message de groupe
+      const user = req.user!;
+      if (message.targetRole !== user.role && message.senderId !== user.id) {
+        return res.status(403).json({ message: "Vous n'avez pas accès à ce message" });
+      }
+      
+      // Si le message est ciblé par région, vérifier que l'utilisateur est dans cette région
+      if (message.targetRegion && message.targetRegion !== user.region && message.senderId !== user.id) {
+        return res.status(403).json({ message: "Ce message est destiné à une autre région" });
+      }
+      
+      // Marquer le message comme lu par cet utilisateur
+      await storage.markGroupMessageAsRead(messageId, user.id);
+      
+      res.json(message);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du message de groupe:", error);
+      res.status(500).json({ message: "Échec de la récupération du message de groupe" });
+    }
+  });
+  
+  app.post("/api/group-messages", isAuthenticated, async (req, res) => {
+    try {
+      const validatedData = insertGroupMessageSchema.parse(req.body);
+      
+      // Vérifier que l'expéditeur est bien l'utilisateur connecté
+      if (validatedData.senderId !== req.user!.id) {
+        return res.status(403).json({ message: "Vous ne pouvez pas envoyer des messages au nom d'un autre utilisateur" });
+      }
+      
+      // Vérifier que l'utilisateur a les droits pour envoyer des messages de groupe
+      const userRole = req.user!.role;
+      if (userRole !== 'admin' && userRole !== 'agent') {
+        return res.status(403).json({ message: "Seuls les administrateurs et les agents peuvent envoyer des messages de groupe" });
+      }
+      
+      const message = await storage.createGroupMessage(validatedData);
+      
+      // Ajouter une entrée à l'historique
+      await storage.createHistory({
+        userId: req.user!.id,
+        operation: "create",
+        entityType: "group_message",
+        entityId: message.id,
+        details: `Message de groupe envoyé aux ${validatedData.targetRole}s${validatedData.targetRegion ? ' de la région ' + validatedData.targetRegion : ''}`
+      });
+      
+      res.status(201).json(message);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Données de message invalides", errors: error.errors });
+      }
+      console.error("Erreur lors de la création du message de groupe:", error);
+      res.status(500).json({ message: "Échec de la création du message de groupe" });
+    }
+  });
+  
+  app.put("/api/group-messages/:id/read", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const userId = req.user!.id;
+      const result = await storage.markGroupMessageAsRead(messageId, userId);
+      
+      res.json({ message: "Message marqué comme lu", data: result });
+    } catch (error) {
+      console.error("Erreur lors du marquage du message de groupe comme lu:", error);
+      res.status(500).json({ message: "Échec du marquage du message de groupe comme lu" });
+    }
+  });
+  
+  app.delete("/api/group-messages/:id", isAuthenticated, async (req, res) => {
+    try {
+      const messageId = parseInt(req.params.id);
+      if (isNaN(messageId)) {
+        return res.status(400).json({ message: "ID de message invalide" });
+      }
+      
+      const message = await storage.getGroupMessage(messageId);
+      if (!message) {
+        return res.status(404).json({ message: "Message non trouvé" });
+      }
+      
+      const userId = req.user!.id;
+      const userRole = req.user!.role;
+      const isAdmin = userRole === 'admin';
+      const isAgent = userRole === 'agent' || userRole === 'sub-agent';
+      const isSender = message.senderId === userId;
+      
+      // L'administrateur peut supprimer complètement n'importe quel message
+      if (isAdmin) {
+        // Supprimer définitivement le message et toutes les références de lecture
+        // Note: Cela nécessite une fonction dans storage pour supprimer complètement
+        try {
+          await db.delete(groupMessageReads).where(eq(groupMessageReads.messageId, messageId));
+          await db.delete(groupMessages).where(eq(groupMessages.id, messageId));
+          
+          // Enregistrer dans l'historique
+          await storage.createHistory({
+            userId: userId,
+            operation: "delete",
+            entityType: "group_message",
+            entityId: messageId,
+            details: `Suppression administrative d'un message de groupe`
+          });
+          
+          return res.json({ message: "Message de groupe supprimé définitivement par l'administrateur" });
+        } catch (err) {
+          console.error("Erreur lors de la suppression définitive du message:", err);
+          return res.status(500).json({ message: "Échec de la suppression définitive du message" });
+        }
+      }
+      
+      // Les agents peuvent aussi supprimer les messages (qu'ils soient expéditeurs ou non)
+      if (isAgent) {
+        if (isSender) {
+          try {
+            // L'agent qui a envoyé le message peut le supprimer définitivement
+            await db.delete(groupMessageReads).where(eq(groupMessageReads.messageId, messageId));
+            await db.delete(groupMessages).where(eq(groupMessages.id, messageId));
+            
+            await storage.createHistory({
+              userId: userId,
+              operation: "delete",
+              entityType: "group_message",
+              entityId: messageId,
+              details: `Suppression d'un message de groupe par son expéditeur agent`
+            });
+            
+            return res.json({ message: "Message de groupe supprimé définitivement" });
+          } catch (err) {
+            console.error("Erreur lors de la suppression du message par l'agent:", err);
+            return res.status(500).json({ message: "Échec de la suppression du message" });
+          }
+        } else {
+          // Pour l'agent qui n'est pas l'expéditeur, marquer comme supprimé pour lui
+          await storage.markGroupMessageAsDeleted(messageId, userId);
+          return res.json({ message: "Message de groupe masqué pour vous" });
+        }
+      }
+      
+      // Pour les autres utilisateurs (chasseurs, etc.)
+      // Marquer le message comme supprimé/caché pour cet utilisateur
+      await storage.markGroupMessageAsDeleted(messageId, userId);
+      return res.json({ message: "Message de groupe masqué pour vous" });
+    } catch (error) {
+      console.error("Erreur lors de la suppression du message de groupe:", error);
+      res.status(500).json({ message: "Échec de la suppression du message de groupe" });
+    }
+  });
+
+  // Settings API routes - Campagne de chasse
+  app.get("/api/settings/campaign", async (req, res) => {
+    try {
+      // Renvoyer les paramètres par défaut pour la campagne de chasse actuelle
+      const currentYear = new Date().getFullYear();
+      res.json({
+        year: currentYear,
+        region: "SN",
+        startDate: `${currentYear}-11-15`,
+        endDate: `${currentYear + 1}-04-30`,
+        waterGameStartDate: `${currentYear}-11-15`,
+        waterGameEndDate: `${currentYear + 1}-04-30`,
+      });
+    } catch (error) {
+      console.error("Error retrieving campaign settings:", error);
+      res.status(500).json({ message: "Failed to retrieve campaign settings" });
+    }
+  });
+  
+  // Route alternative - Utilisée par la page PermitRequest
+  app.get("/api/settings/hunting-campaign", async (req, res) => {
+    try {
+      // Récupérer les paramètres de la campagne de chasse depuis la base de données
+      const campaignSettings = await storage.getHuntingCampaignSettings();
+      const today = new Date();
+      
+      // Si des paramètres existent, les utiliser
+      if (campaignSettings) {
+        const startDate = new Date(campaignSettings.startDate);
+        const endDate = new Date(campaignSettings.endDate);
+        
+        // Déterminer si la campagne est active en fonction de la date actuelle
+        const isActive = today >= startDate && today <= endDate;
+        
+        // Renvoyer les paramètres avec l'état d'activation calculé
+        return res.json({
+          ...campaignSettings,
+          name: `Campagne de Chasse ${campaignSettings.year}`,
+          isActive: isActive
+        });
+      }
+      
+      // Si aucun paramètre n'existe, créer des valeurs par défaut
+      const currentYear = new Date().getFullYear();
+      const defaultStartDate = new Date(`${currentYear}-11-15`);
+      const defaultEndDate = new Date(`${currentYear + 1}-04-30`);
+      const isActive = today >= defaultStartDate && today <= defaultEndDate;
+      
+      const defaultCampaignData = {
+        year: currentYear.toString(),
+        name: `Campagne de Chasse ${currentYear}-${currentYear + 1}`,
+        region: "SN",
+        startDate: defaultStartDate.toISOString(),
+        endDate: defaultEndDate.toISOString(),
+        waterGameStartDate: defaultStartDate.toISOString(),
+        waterGameEndDate: defaultEndDate.toISOString(),
+        isActive: isActive
+      };
+      
+      res.json(defaultCampaignData);
+    } catch (error) {
+      console.error("Error retrieving hunting campaign settings:", error);
+      res.status(500).json({ message: "Failed to retrieve hunting campaign settings" });
+    }
+  });
+  
+  // Endpoint pour mettre à jour les paramètres de la campagne de chasse
+  app.post("/api/settings/hunting-campaign", async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé, seul un administrateur peut modifier les paramètres de la campagne" });
+      }
+      
+      const campaignData = req.body;
+      
+      // Validation de base des données reçues
+      if (!campaignData.startDate || !campaignData.endDate) {
+        return res.status(400).json({ 
+          message: "Les dates de début et de fin sont obligatoires" 
+        });
+      }
+      
+      // Convertir les dates en objets Date pour validation
+      const startDate = new Date(campaignData.startDate);
+      const endDate = new Date(campaignData.endDate);
+      
+      // Vérifier que la date de fin est après la date de début
+      if (endDate <= startDate) {
+        return res.status(400).json({ 
+          message: "La date de fin doit être postérieure à la date de début" 
+        });
+      }
+      
+      // Dans une version future, ce code sauvegardera les données dans une base de données
+      // Pour l'instant, nous allons simplement enregistrer les données dans les logs et retourner une réponse
+      console.log("Paramètres de la campagne cynégétique mis à jour:", campaignData);
+
+      // Ajouter une entrée dans l'historique
+      if (req.user?.id) {
+        await storage.createHistory({
+          userId: req.user.id,
+          operation: "update",
+          entityType: "hunting_campaign_settings",
+          entityId: 0,
+          details: `Mise à jour des paramètres de la campagne cynégétique: du ${new Date(campaignData.startDate).toLocaleDateString()} au ${new Date(campaignData.endDate).toLocaleDateString()}`
+        });
+      }
+      
+      res.json({
+        message: "Paramètres de la campagne cynégétique sauvegardés avec succès",
+        data: {
+          ...campaignData,
+          // Assurer que les dates sont au format ISO
+          startDate: new Date(campaignData.startDate).toISOString(),
+          endDate: new Date(campaignData.endDate).toISOString()
+        }
+      });
+    } catch (error) {
+      console.error("Error saving hunting campaign settings:", error);
+      res.status(500).json({ message: "Failed to save hunting campaign settings" });
+    }
+  });
+  
+  // Settings API routes - Tarifs des permis
+  app.get("/api/settings/permit-fees", async (req, res) => {
+    try {
+      // Renvoyer les tarifs par défaut des permis
+      res.json({
+        sportifPetiteChasseResident: 15000,
+        sportifPetiteChasseTourriste1Week: 15000,
+        sportifPetiteChasseTourriste2Weeks: 25000,
+        sportifPetiteChasseTourriste1Month: 45000,
+        coutumierPetiteChasse: 3000,
+        grandeChaseResident: 45000,
+        grandeChasseTourriste1Week: 30000,
+        grandeChasseTourriste2Weeks: 50000,
+        grandeChasseTourriste1Month: 90000,
+        specialGibierEauResident: 30000,
+        specialGibierEauTourriste1Week: 15000,
+        specialGibierEauTourriste1Month: 45000
+      });
+    } catch (error) {
+      console.error("Error retrieving permit fees settings:", error);
+      res.status(500).json({ message: "Failed to retrieve permit fees settings" });
+    }
+  });
+
+  // Hunting Guide API Routes
+  app.get("/api/guides", isAuthenticated, async (req, res) => {
+    try {
+      // L'accès est autorisé pour les administrateurs, les agents et les agents secteur
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      // Les administrateurs ont accès à tous les guides
+      if (req.user.role === "admin") {
+        const guides = await storage.getAllHuntingGuides();
+        return res.json(guides);
+      }
+      
+      // Pour les agents régionaux, filtrer par région
+      if (req.user.role === "agent") {
+        if (!req.user.region) {
+          return res.status(400).json({ message: "Région non définie pour cet agent" });
+        }
+        
+        // Récupérer les guides de la région spécifique
+        const guides = await storage.getHuntingGuidesByRegion(req.user.region);
+        return res.json(guides);
+      }
+      
+      // Pour les agents secteur, filtrer par zone (département)
+      if (req.user.role === "sub-agent") {
+        // Récupérer la zone (département) de l'utilisateur depuis la requête ou l'utilisateur
+        const zone = req.query.zone as string || req.user.zone;
+        
+        if (!zone) {
+          return res.status(400).json({ message: "Zone non définie pour cet agent secteur" });
+        }
+        
+        // Récupérer les guides de la zone spécifique
+        const guides = await storage.getHuntingGuidesByZone(zone);
+        return res.json(guides);
+      }
+      
+      // Si on arrive ici, c'est une erreur
+      res.status(500).json({ message: "Une erreur est survenue lors de la récupération des guides" });
+    } catch (error) {
+      console.error("Erreur lors de la récupération des guides de chasse:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des guides de chasse" });
+    }
+  });
+
+  // Endpoint spécifique pour récupérer les guides de chasse d'une zone particulière
+  app.get("/api/hunting-guides/zone/:zone", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un agent secteur ou admin ou agent
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      const zone = req.params.zone;
+      if (!zone) {
+        return res.status(400).json({ message: "Zone non spécifiée" });
+      }
+      
+      // Si c'est un agent secteur, vérifier que la zone correspond à sa zone
+      if (req.user.role === "sub-agent" && req.user.zone && req.user.zone !== zone) {
+        return res.status(403).json({ message: "Vous n'avez pas accès aux guides de cette zone" });
+      }
+      
+      const guides = await storage.getHuntingGuidesByZone(zone);
+      res.json(guides);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des guides de chasse par zone:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des guides de chasse par zone" });
+    }
+  });
+  
+  // Route pour récupérer les informations du guide connecté
+  app.get("/api/guides/me", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un guide de chasse
+      if (req.user?.role !== "hunting-guide") {
+        return res.status(403).json({ message: "Accès limité aux guides de chasse" });
+      }
+      
+      // Récupérer le guide associé à l'ID utilisateur connecté
+      const guides = await storage.getAllHuntingGuides();
+      const guide = guides.find(g => g.userId === req.user?.id);
+      
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé pour cet utilisateur" });
+      }
+      
+      res.json(guide);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du guide de chasse:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération du guide de chasse" });
+    }
+  });
+  
+  // Route pour récupérer tous les chasseurs (pour l'association)
+  app.get("/api/hunters/all", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un guide de chasse, un admin ou un agent
+      if (req.user?.role !== "hunting-guide" && req.user?.role !== "admin" && req.user?.role !== "agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+      
+      const hunters = await storage.getAllHunters();
+      res.json(hunters);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des chasseurs" });
+    }
+  });
+  
+  // Route pour récupérer les chasseurs associés à un guide
+  app.get("/api/guides/hunters", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un guide de chasse
+      if (req.user?.role !== "hunting-guide") {
+        return res.status(403).json({ message: "Accès limité aux guides de chasse" });
+      }
+      
+      // Récupérer le guide associé à l'ID utilisateur connecté
+      const guides = await storage.getAllHuntingGuides();
+      const guide = guides.find(g => g.userId === req.user?.id);
+      
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé pour cet utilisateur" });
+      }
+      
+      const associations = await storage.getGuideHunterAssociationsWithHunters(guide.id);
+      res.json(associations);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des chasseurs associés:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des chasseurs associés" });
+    }
+  });
+  
+  // Route pour associer des chasseurs à un guide
+  app.post("/api/guides/associate-hunters", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un guide de chasse
+      if (req.user?.role !== "hunting-guide") {
+        return res.status(403).json({ message: "Accès limité aux guides de chasse" });
+      }
+      
+      // Extraire l'ID des chasseurs du corps de la requête
+      const { hunterIds } = req.body;
+      
+      if (!hunterIds || !Array.isArray(hunterIds) || hunterIds.length === 0) {
+        return res.status(400).json({ message: "IDs des chasseurs manquants ou invalides" });
+      }
+      
+      // Récupérer le guide associé à l'ID utilisateur connecté
+      const guides = await storage.getAllHuntingGuides();
+      const guide = guides.find(g => g.userId === req.user?.id);
+      
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé pour cet utilisateur" });
+      }
+      
+      // Associer chaque chasseur au guide
+      const results = [];
+      for (const hunterId of hunterIds) {
+        try {
+          const association = await storage.associateHunterToGuide(guide.id, hunterId);
+          results.push(association);
+        } catch (err) {
+          console.error(`Erreur lors de l'association du chasseur ${hunterId}:`, err);
+          // Continuer avec les autres chasseurs
+        }
+      }
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user.id,
+        operation: "associate",
+        entityType: "guide-hunters",
+        entityId: guide.id,
+        details: `Association de ${results.length} chasseur(s) au guide ${guide.firstName} ${guide.lastName}`
+      });
+      
+      res.status(200).json({ 
+        message: `${results.length} chasseur(s) associé(s) avec succès`,
+        associations: results 
+      });
+    } catch (error) {
+      console.error("Erreur lors de l'association des chasseurs:", error);
+      res.status(500).json({ message: "Erreur lors de l'association des chasseurs" });
+    }
+  });
+  
+  // Route pour dissocier un chasseur d'un guide
+  app.delete("/api/guides/remove-hunter/:hunterId", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un guide de chasse
+      if (req.user?.role !== "hunting-guide") {
+        return res.status(403).json({ message: "Accès limité aux guides de chasse" });
+      }
+      
+      const hunterId = parseInt(req.params.hunterId);
+      
+      if (isNaN(hunterId)) {
+        return res.status(400).json({ message: "ID du chasseur invalide" });
+      }
+      
+      // Récupérer le guide associé à l'ID utilisateur connecté
+      const guides = await storage.getAllHuntingGuides();
+      const guide = guides.find(g => g.userId === req.user?.id);
+      
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé pour cet utilisateur" });
+      }
+      
+      // Vérifier que le chasseur est bien associé à ce guide
+      const associations = await storage.getGuideHunterAssociations(guide.id);
+      const isAssociated = associations.some(a => a.hunterId === hunterId);
+      
+      if (!isAssociated) {
+        return res.status(404).json({ message: "Ce chasseur n'est pas associé à ce guide" });
+      }
+      
+      // Dissocier le chasseur
+      const success = await storage.removeHunterAssociation(guide.id, hunterId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Échec de la dissociation du chasseur" });
+      }
+      
+      // Récupérer les informations du chasseur pour l'historique
+      const hunter = await storage.getHunter(hunterId);
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user.id,
+        operation: "remove-association",
+        entityType: "guide-hunter",
+        entityId: guide.id,
+        details: `Dissociation du chasseur ${hunter?.firstName} ${hunter?.lastName} (ID: ${hunterId}) du guide ${guide.firstName} ${guide.lastName}`
+      });
+      
+      res.status(200).json({ 
+        message: "Chasseur dissocié avec succès" 
+      });
+    } catch (error) {
+      console.error("Erreur lors de la dissociation du chasseur:", error);
+      res.status(500).json({ message: "Erreur lors de la dissociation du chasseur" });
+    }
+  });
+
+  app.get("/api/guides/:id", isAuthenticated, async (req, res) => {
+    try {
+      // L'accès est autorisé pour les administrateurs, les agents et les agents secteur
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de guide invalide" });
+      }
+      
+      const guide = await storage.getHuntingGuide(id);
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé" });
+      }
+      
+      // Si c'est un agent ou un agent secteur, vérifier que le guide est dans sa région
+      if (req.user.role === "agent" || req.user.role === "sub-agent") {
+        if (!req.user.region || guide.region !== req.user.region) {
+          return res.status(403).json({ message: "Vous n'avez pas accès à ce guide qui n'est pas dans votre région" });
+        }
+      }
+      
+      res.json(guide);
+    } catch (error) {
+      console.error("Erreur lors de la récupération du guide de chasse:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération du guide de chasse" });
+    }
+  });
+
+  app.post("/api/guides", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      // Valider les données
+      const data = createHuntingGuideWithUserSchema.parse(req.body);
+      
+      // Vérifier si un guide avec le même numéro d'identité existe déjà
+      const existingGuide = await storage.getHuntingGuideByIdNumber(data.idNumber);
+      if (existingGuide) {
+        return res.status(400).json({ message: "Un guide avec ce numéro d'identité existe déjà" });
+      }
+
+      // Vérifier si le nom d'utilisateur existe déjà
+      const existingUser = await storage.getUserByUsername(data.username);
+      if (existingUser) {
+        return res.status(400).json({ message: "Ce nom d'utilisateur est déjà utilisé" });
+      }
+
+      // 1. Créer le compte utilisateur
+      // Utiliser le rôle 'agent' au lieu de 'hunting-guide' qui n'existe pas dans l'enum PostgreSQL
+      const user = await storage.createUser({
+        username: data.username,
+        password: data.password,
+        email: data.email,
+        role: "agent", // Remplacé 'hunting-guide' par 'agent' pour éviter l'erreur d'enum
+        firstName: data.firstName,
+        lastName: data.lastName,
+        phone: data.phone,
+        region: data.region
+      });
+
+      // 2. Créer la fiche du guide de chasse
+      const guide = await storage.createHuntingGuide({
+        lastName: data.lastName,
+        firstName: data.firstName,
+        phone: data.phone,
+        zone: data.zone,
+        region: data.region,
+        idNumber: data.idNumber,
+        photo: data.photo,
+        userId: user.id
+      });
+
+      // 3. Ajouter une entrée dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "create",
+        entityType: "hunting_guide",
+        entityId: guide.id,
+        details: `Guide de chasse créé: ${guide.lastName} ${guide.firstName}`
+      });
+
+      res.status(201).json(guide);
+    } catch (error) {
+      console.error("Erreur lors de la création du guide de chasse:", error);
+      
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Données invalides", 
+          errors: error.errors 
+        });
+      }
+      
+      res.status(500).json({ message: "Erreur lors de la création du guide de chasse" });
+    }
+  });
+
+  app.patch("/api/guides/:id/status", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de guide invalide" });
+      }
+      
+      const { isActive } = req.body;
+      if (typeof isActive !== 'boolean') {
+        return res.status(400).json({ message: "Le statut doit être un booléen" });
+      }
+      
+      // Mettre à jour le statut du guide
+      const guide = await storage.updateHuntingGuide(id, { isActive });
+      if (!guide) {
+        return res.status(404).json({ message: "Guide de chasse non trouvé" });
+      }
+      
+      // Mettre à jour le statut du compte utilisateur associé
+      if (guide.userId) {
+        await storage.updateUser(guide.userId, { isActive });
+      }
+      
+      // Ajouter une entrée dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "update",
+        entityType: "hunting_guide",
+        entityId: id,
+        details: `Statut du guide de chasse mis à jour: ${guide.lastName} ${guide.firstName} (${isActive ? 'Activé' : 'Désactivé'})`
+      });
+      
+      res.json(guide);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du statut du guide:", error);
+      res.status(500).json({ message: "Erreur lors de la mise à jour du statut du guide" });
+    }
+  });
+
+  // Endpoint pour supprimer tous les guides de chasse (réservé aux administrateurs)
+  app.delete("/api/guides/all", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un administrateur
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      // Supprimer tous les guides de chasse
+      const deletedCount = await storage.deleteAllHuntingGuides();
+      
+      // Ajouter une entrée dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "delete",
+        entityType: "hunting_guide",
+        entityId: 0, // 0 indique une opération globale
+        details: `Suppression de tous les guides de chasse (${deletedCount} guides supprimés)`
+      });
+      
+      res.json({ message: `${deletedCount} guides de chasse ont été supprimés` });
+    } catch (error) {
+      console.error("Erreur lors de la suppression de tous les guides de chasse:", error);
+      res.status(500).json({ message: "Erreur lors de la suppression de tous les guides de chasse" });
+    }
+  });
+
+  // User API routes
+  app.post("/api/users", async (req, res) => {
+    try {
+      // Validate user data
+      const validatedData = insertUserSchema.parse(req.body);
+      
+      // Check if username already exists
+      const existingUsername = await storage.getUserByUsername(validatedData.username);
+      if (existingUsername) {
+        return res.status(400).json({ message: "Ce nom d'utilisateur existe déjà" });
+      }
+      
+      // Check if email already exists
+      const existingEmail = await storage.getUserByEmail(validatedData.email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Cet email est déjà utilisé" });
+      }
+      
+      // Si c'est un compte de chasseur, il faut vérifier et associer le chasseur
+      if (validatedData.role === 'hunter' && validatedData.hunterId) {
+        // Vérifier que le ID de chasseur existe
+        const hunter = await storage.getHunter(validatedData.hunterId);
+        if (!hunter) {
+          return res.status(400).json({ message: "Chasseur non trouvé" });
+        }
+        
+        // Vérifier si ce chasseur a déjà un utilisateur associé
+        const existingUsers = await storage.getAllUsers();
+        const alreadyHasUser = existingUsers.some(u => u.hunterId === validatedData.hunterId);
+        
+        if (alreadyHasUser) {
+          return res.status(400).json({ 
+            message: "Ce chasseur a déjà un compte utilisateur associé"
+          });
+        }
+        
+        console.log(`Création d'un compte utilisateur pour le chasseur ID ${validatedData.hunterId}`);
+      }
+      
+      // Create user
+      const user = await storage.createUser(validatedData);
+      console.log("Utilisateur créé avec succès:", user);
+      
+      // Préparer un message SMS pour le nouveau compte si c'est un chasseur
+      if (validatedData.role === 'hunter' && user.hunterId) {
+        try {
+          const hunter = await storage.getHunter(user.hunterId);
+          if (hunter && hunter.phone) {
+            const smsMessage = `Bienvenue sur SIGPE! Votre compte de chasseur a été créé avec succès. Nom d'utilisateur: ${user.username}, Mot de passe: ${validatedData.password}. Veuillez vous connecter et changer votre mot de passe.`;
+            
+            // Stocker le message dans l'historique pour l'envoi SMS
+            await storage.createHistory({
+              operation: "sms_notification",
+              entityType: "user", 
+              entityId: user.id,
+              details: `SMS notification for hunter user: ${user.username} to phone ${hunter.phone}: ${smsMessage}`
+            });
+            
+            console.log(`SMS notification prepared for new hunter user ${user.username} (ID: ${user.id}) to phone ${hunter.phone}`);
+          }
+        } catch (smsError) {
+          console.error("Erreur lors de la préparation de la notification SMS:", smsError);
+        }
+      }
+      
+      // Add history record
+      await storage.createHistory({
+        operation: "create",
+        entityType: "user",
+        entityId: user.id,
+        details: `Utilisateur créé: ${user.username} avec le rôle ${user.role}`,
+      });
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = user;
+      
+      res.status(201).json(userWithoutPassword);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Données utilisateur invalides", errors: error.errors });
+      }
+      console.error("Error creating user:", error);
+      res.status(500).json({ message: "Échec de la création de l'utilisateur" });
+    }
+  });
+  
+  app.get("/api/users", async (req, res) => {
+    try {
+      const users = await storage.getAllUsers();
+      
+      // Remove passwords from response
+      const usersWithoutPasswords = users.map(user => {
+        const { password, ...userWithoutPassword } = user;
+        return userWithoutPassword;
+      });
+      
+      res.json(usersWithoutPasswords);
+    } catch (error) {
+      res.status(500).json({ message: "Échec de la récupération des utilisateurs" });
+    }
+  });
+  
+  app.get("/api/users/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const user = await storage.getUser(id);
+      
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Remove password from response
+      const { password, ...userWithoutPassword } = user;
+      
+      res.json(userWithoutPassword);
+    } catch (error) {
+      res.status(500).json({ message: "Échec de la récupération de l'utilisateur" });
+    }
+  });
+  
+  // Route pour supprimer un utilisateur (admin uniquement)
+  app.delete("/api/users/:id", isAuthenticated, async (req, res) => {
+    try {
+      console.log("📝 Début de la route de suppression d'utilisateur");
+  
+      // Vérifier que l'utilisateur est un admin
+      if (req.user?.role !== "admin") {
+        console.error(`❌ Accès refusé pour l'utilisateur ${req.user?.username} avec le rôle ${req.user?.role}`);
+        return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent supprimer des utilisateurs." });
+      }
+      
+      const userId = parseInt(req.params.id);
+      if (isNaN(userId)) {
+        console.error("❌ ID utilisateur invalide:", req.params.id);
+        return res.status(400).json({ message: "ID utilisateur invalide" });
+      }
+      
+      console.log(`🔍 Tentative de suppression de l'utilisateur avec ID: ${userId}`);
+      console.log(`👤 Utilisateur demandant la suppression: ${req.user?.username} (${req.user?.role})`);
+      
+      // Vérifier si le paramètre force est présent
+      const forceDelete = req.query.force === 'true';
+      console.log(`👉 Force delete paramètre: ${forceDelete}`);
+  
+      // Obtenir l'utilisateur pour vérifier qu'il existe
+      const user = await storage.getUser(userId);
+      if (!user) {
+        console.error(`❌ Utilisateur avec ID ${userId} non trouvé`);
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      console.log(`✅ Utilisateur trouvé: ${user.username} (${user.role})`);
+      
+      // Ne pas autoriser la suppression d'un administrateur
+      if (user.role === "admin") {
+        console.error(`❌ Tentative de suppression d'un administrateur (${user.username})`);
+        return res.status(403).json({ message: "Impossible de supprimer un administrateur" });
+      }
+      
+      // Vérifier s'il s'agit d'un utilisateur avec des entités associées (hunter)
+      if (user.role === "hunter" && user.hunterId) {
+        console.log(`👉 L'utilisateur est associé à un chasseur (ID: ${user.hunterId})`);
+        
+        try {
+          // Si force=true, supprimer le chasseur d'abord
+          if (forceDelete) {
+            console.log(`👉 Tentative de suppression forcée du chasseur associé (ID: ${user.hunterId})`);
+            const hunterDeleted = await storage.deleteHunter(user.hunterId, true);
+            
+            if (!hunterDeleted) {
+              console.error(`❌ Échec de la suppression du chasseur associé`);
+              return res.status(500).json({ 
+                message: "Échec de la suppression du chasseur associé à cet utilisateur"
+              });
+            }
+            
+            console.log(`✅ Chasseur associé supprimé avec succès`);
+          }
+        } catch (error) {
+          console.error(`❌ Erreur lors de la suppression du chasseur associé:`, error);
+          return res.status(500).json({ 
+            message: "Erreur lors de la suppression du chasseur associé à cet utilisateur"
+          });
+        }
+      }
+      
+      // Supprimer l'utilisateur
+      console.log(`🗑️ Appel de la méthode deleteUser pour l'ID ${userId}`);
+      const deleted = await storage.deleteUser(userId);
+      
+      if (!deleted) {
+        console.error(`❌ La méthode deleteUser a retourné false pour l'ID ${userId}`);
+        return res.status(500).json({ message: "Échec de la suppression de l'utilisateur" });
+      }
+      
+      console.log(`✅ Suppression réussie de l'utilisateur ${userId}`);
+      
+      // Créer une entrée dans l'historique
+      try {
+        console.log(`📝 Ajout d'une entrée d'historique pour la suppression de l'utilisateur ${userId}`);
+        await storage.createHistory({
+          userId: req.user?.id,
+          entityId: userId,
+          entityType: "user",
+          operation: "delete",
+          details: `Utilisateur supprimé: ${user.username}`
+        });
+        console.log(`✅ Entrée d'historique créée avec succès`);
+      } catch (historyError) {
+        console.error(`⚠️ Erreur lors de la création de l'entrée d'historique:`, historyError);
+        // On continue malgré l'erreur d'historique
+      }
+      
+      console.log(`🎉 Suppression de l'utilisateur ${userId} complétée avec succès`);
+      res.status(200).json({ message: "Utilisateur supprimé avec succès" });
+    } catch (error) {
+      console.error("❌ Erreur lors de la suppression de l'utilisateur:", error);
+      
+      // Log plus détaillé de l'erreur
+      if (error instanceof Error) {
+        console.error("Type d'erreur:", error.name);
+        console.error("Message d'erreur:", error.message);
+        console.error("Stack trace:", error.stack);
+      }
+      
+      res.status(500).json({ 
+        message: "Erreur serveur lors de la suppression de l'utilisateur",
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+
+  // Route pour réinitialiser le mot de passe d'un utilisateur (admin uniquement)
+  app.post("/api/users/:id/reset-password", isAuthenticated, async (req, res) => {
+    // Vérifier que l'utilisateur est un admin
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Accès refusé. Seuls les administrateurs peuvent réinitialiser les mots de passe." });
+    }
+    
+    const userId = parseInt(req.params.id);
+    if (isNaN(userId)) {
+      return res.status(400).json({ message: "ID utilisateur invalide" });
+    }
+
+    try {
+      // Obtenir l'utilisateur pour vérifier qu'il existe
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Ne pas autoriser la réinitialisation du mot de passe d'un administrateur
+      if (user.role === "admin" && user.id !== req.user.id) {
+        return res.status(403).json({ message: "Impossible de réinitialiser le mot de passe d'un autre administrateur" });
+      }
+      
+      // Générer un mot de passe temporaire
+      const defaultPassword = "Password123!"; // Mot de passe temporaire
+      
+      // Mettre à jour l'utilisateur avec le nouveau mot de passe
+      const updatedUser = await storage.updateUser(userId, {
+        password: defaultPassword
+      });
+      
+      if (!updatedUser) {
+        return res.status(500).json({ message: "Échec de la réinitialisation du mot de passe" });
+      }
+      
+      // Créer une entrée dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        entityId: userId,
+        entityType: "user",
+        operation: "reset_password",
+        details: `Mot de passe réinitialisé pour l'utilisateur ${user.username}`
+      });
+      
+      res.status(200).json({ message: "Mot de passe réinitialisé avec succès", defaultPassword });
+    } catch (error) {
+      console.error("Erreur lors de la réinitialisation du mot de passe:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // API pour générer un numéro de permis
+  app.get("/api/permits/generate-number/:hunterId", async (req, res) => {
+    try {
+      const hunterId = parseInt(req.params.hunterId);
+      if (isNaN(hunterId)) {
+        return res.status(400).json({ message: "ID de chasseur invalide" });
+      }
+
+      // Vérifier si le chasseur existe
+      const hunter = await storage.getHunter(hunterId);
+      if (!hunter) {
+        return res.status(404).json({ message: "Chasseur non trouvé" });
+      }
+
+      // Obtenir tous les permis pour déterminer le dernier numéro de séquence global
+      const allPermits = await storage.getAllPermits();
+      
+      // Générer le numéro de permis
+      const currentYear = new Date().getFullYear();
+      const regionPrefix = "SN"; // Code par défaut pour le Sénégal
+      
+      // Trouver le dernier numéro de séquence (global, pas seulement pour ce chasseur)
+      const lastSeq = allPermits.length > 0 
+        ? Math.max(...allPermits.map(p => {
+            const parts = p.permitNumber.split('-');
+            return parts.length > 2 ? parseInt(parts[2]) || 0 : 0;
+          }))
+        : 0;
+      
+      const nextSeq = (lastSeq + 1).toString().padStart(3, '0');
+      const permitNumber = `P-${regionPrefix}-${currentYear}-${nextSeq}-${hunterId}`;
+      
+      res.json({ permitNumber, hunterCategory: hunter.category });
+    } catch (error) {
+      console.error("Error generating permit number:", error);
+      res.status(500).json({ message: "Échec de la génération du numéro de permis" });
+    }
+  });
+  
+  // API pour récupérer les agents
+  app.get("/api/users/agents", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier que l'utilisateur est un admin
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ 
+          message: "Accès refusé. Seul l'administrateur peut récupérer la liste des agents." 
+        });
+      }
+      
+      // Récupérer tous les agents
+      const agents = await storage.getUsersByRole("agent");
+      
+      // Ajouter les sous-agents (sub-agent) aussi
+      const subAgents = await storage.getUsersByRole("sub-agent");
+      
+      // Combiner les deux tableaux
+      const allAgents = [...agents, ...subAgents];
+      
+      res.json(allAgents);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des agents:", error);
+      res.status(500).json({ message: "Échec de la récupération des agents" });
+    }
+  });
+
+  // API pour mettre à jour les informations d'un utilisateur (agent ou admin)
+  app.patch("/api/users/:id", isAuthenticated, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.id);
+      
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID d'utilisateur invalide" });
+      }
+      
+      // Vérifier que l'utilisateur met à jour son propre profil ou est un administrateur
+      if (userId !== req.user?.id && req.user?.role !== "admin") {
+        return res.status(403).json({ 
+          message: "Accès refusé. Vous ne pouvez mettre à jour que votre propre profil ou être administrateur."
+        });
+      }
+      
+      // Récupérer l'utilisateur actuel
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Préparer les données à mettre à jour
+      const { 
+        firstName, lastName, phone, matricule, serviceLocation, 
+        assignmentPost, region, email
+      } = req.body;
+      
+      const updateData: any = {};
+      
+      // N'ajouter que les champs fournis
+      if (firstName !== undefined) updateData.firstName = firstName;
+      if (lastName !== undefined) updateData.lastName = lastName;
+      if (phone !== undefined) updateData.phone = phone;
+      if (matricule !== undefined) updateData.matricule = matricule;
+      if (serviceLocation !== undefined) updateData.serviceLocation = serviceLocation;
+      if (assignmentPost !== undefined) updateData.assignmentPost = assignmentPost;
+      if (region !== undefined) updateData.region = region;
+      if (email !== undefined) updateData.email = email;
+      
+      // Seuls les administrateurs peuvent mettre à jour certains champs pour d'autres utilisateurs
+      if (userId !== req.user?.id && req.user?.role !== "admin") {
+        delete updateData.matricule;
+        delete updateData.serviceLocation;
+        delete updateData.assignmentPost;
+        delete updateData.region;
+      }
+      
+      // Mettre à jour l'utilisateur
+      const updatedUser = await storage.updateUser(userId, updateData);
+      
+      if (!updatedUser) {
+        return res.status(500).json({ message: "Échec de la mise à jour du profil" });
+      }
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "update",
+        entityType: "user",
+        entityId: userId,
+        details: `Mise à jour du profil ${user.role}: ${user.username}`
+      });
+      
+      res.status(200).json(updatedUser);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour du profil:", error);
+      res.status(500).json({ message: "Échec de la mise à jour du profil" });
+    }
+  });
+
+  // Route pour suspendre un compte utilisateur
+  app.post("/api/users/:id/suspend", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul un admin peut suspendre un compte)
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Action non autorisée" });
+      }
+
+      const userId = parseInt(req.params.id);
+      
+      // Vérifier que l'utilisateur existe
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Vérifier qu'on ne tente pas de suspendre un compte admin
+      if (user.role === "admin") {
+        return res.status(403).json({ message: "Impossible de suspendre un compte administrateur" });
+      }
+      
+      // Suspendre l'utilisateur
+      const updatedUser = await storage.updateUser(userId, { isSuspended: true });
+      
+      if (!updatedUser) {
+        return res.status(500).json({ message: "Échec de la suspension du compte" });
+      }
+      
+      // Si c'est un chasseur, suspendre tous ses permis actifs
+      if (user.role === "hunter" && user.hunterId) {
+        try {
+          // Récupérer tous les permis actifs du chasseur
+          const activePermits = await storage.getActivePermitsByHunterId(user.hunterId);
+          
+          // Suspendre chaque permis
+          for (const permit of activePermits) {
+            await storage.suspendPermit(permit.id);
+            
+            // Enregistrer dans l'historique pour chaque permis suspendu
+            await storage.createHistory({
+              userId: req.user?.id,
+              operation: "suspend",
+              entityType: "permit",
+              entityId: permit.id,
+              details: `Permis ${permit.permitNumber} suspendu automatiquement suite à la suspension du chasseur`
+            });
+          }
+          
+          console.log(`${activePermits.length} permis suspendus pour le chasseur ID: ${user.hunterId}`);
+        } catch (permitError) {
+          console.error("Erreur lors de la suspension des permis:", permitError);
+          // Continuer malgré l'erreur pour au moins suspendre le compte utilisateur
+        }
+      }
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "suspend",
+        entityType: "user",
+        entityId: userId,
+        details: `Suspension du compte ${user.role}: ${user.username}`
+      });
+      
+      res.status(200).json({ message: "Compte suspendu avec succès", user: updatedUser });
+    } catch (error) {
+      console.error("Erreur lors de la suspension du compte:", error);
+      res.status(500).json({ message: "Échec de la suspension du compte" });
+    }
+  });
+  
+  // Route pour réactiver un compte utilisateur
+  app.post("/api/users/:id/reactivate", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul un admin peut réactiver un compte)
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Action non autorisée" });
+      }
+
+      const userId = parseInt(req.params.id);
+      
+      // Vérifier que l'utilisateur existe
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Utilisateur non trouvé" });
+      }
+      
+      // Réactiver l'utilisateur
+      const updatedUser = await storage.updateUser(userId, { isSuspended: false });
+      
+      if (!updatedUser) {
+        return res.status(500).json({ message: "Échec de la réactivation du compte" });
+      }
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "update",
+        entityType: "user",
+        entityId: userId,
+        details: `Réactivation du compte ${user.role}: ${user.username}`
+      });
+      
+      res.status(200).json({ message: "Compte réactivé avec succès", user: updatedUser });
+    } catch (error) {
+      console.error("Erreur lors de la réactivation du compte:", error);
+      res.status(500).json({ message: "Échec de la réactivation du compte" });
+    }
+  });
+
+  // Routes pour la gestion des permis suspendus
+  app.get("/api/permits/suspended", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seuls admin et agents peuvent voir les permis suspendus)
+      if (req.user?.role !== "admin" && req.user?.role !== "agent" && req.user?.role !== "sub-agent") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      // Récupérer tous les permis suspendus
+      const suspendedPermits = await storage.getSuspendedPermits();
+      res.json(suspendedPermits);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des permis suspendus:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.delete("/api/permits/:id", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul admin peut supprimer un permis)
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      const permitId = parseInt(req.params.id);
+      if (isNaN(permitId)) {
+        return res.status(400).json({ message: "ID de permis invalide" });
+      }
+
+      // Le permis existe déjà, vérifié ci-dessus
+
+      // Supprimer le permis
+      const success = await storage.deletePermit(permitId);
+      
+      if (!success) {
+        return res.status(400).json({ 
+          message: "Impossible de supprimer ce permis. Il pourrait avoir des taxes associées." 
+        });
+      }
+
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "delete",
+        entityType: "permit",
+        entityId: permitId,
+        details: `Suppression du permis ${permit.permitNumber}`
+      });
+
+      res.status(200).json({ message: "Permis supprimé avec succès" });
+    } catch (error) {
+      console.error("Erreur lors de la suppression du permis:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.delete("/api/permits/suspended/all", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul admin peut supprimer tous les permis suspendus)
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      // Supprimer tous les permis suspendus
+      const deletedPermits = await storage.deleteAllSuspendedPermits();
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "delete_multiple",
+        entityType: "permit",
+        entityId: 0,
+        details: `Suppression de tous les permis suspendus (${deletedPermits.length} permis)`
+      });
+
+      res.status(200).json({ 
+        message: `${deletedPermits.length} permis suspendus ont été supprimés avec succès`
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suppression des permis suspendus:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.delete("/api/permits/batch", isAuthenticated, async (req, res) => {
+    try {
+      // Vérifier les permissions (seul admin peut supprimer des permis par lot)
+      if (req.user?.role !== "admin") {
+        return res.status(403).json({ message: "Accès non autorisé" });
+      }
+
+      const { permitIds } = req.body;
+
+      if (!Array.isArray(permitIds) || permitIds.length === 0) {
+        return res.status(400).json({ message: "Liste d'IDs de permis invalide ou vide" });
+      }
+
+      // Supprimer les permis par lot
+      const deletedPermits = await storage.deletePermitBatch(permitIds);
+      
+      // Enregistrer dans l'historique
+      await storage.createHistory({
+        userId: req.user?.id,
+        operation: "delete_multiple",
+        entityType: "permit",
+        entityId: 0,
+        details: `Suppression par lot de ${deletedPermits.length} permis`
+      });
+
+      res.status(200).json({ 
+        message: `${deletedPermits.length} permis ont été supprimés avec succès`
+      });
+    } catch (error) {
+      console.error("Erreur lors de la suppression par lot des permis:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Route pour servir la description du projet au format HTML (peut être converti en PDF par le navigateur)
+  app.get("/project-description", (req, res) => {
+    const path = require('path');
+    res.sendFile(path.resolve('./project-description.html'));
+  });
+
+  // Routes pour les guides de chasse
+  app.post("/api/guides", async (req, res) => {
+    try {
+      console.log("Received hunting guide creation request:", req.body);
+      
+      // Valider les données avec le schéma
+      try {
+        const validatedData = createHuntingGuideWithUserSchema.parse(req.body);
+        
+        // Créer un nouvel utilisateur pour le guide
+        const userData = {
+          username: validatedData.username,
+          password: validatedData.password,
+          email: validatedData.email || 'guide@example.com',
+          role: 'guide',
+          firstName: validatedData.firstName,
+          lastName: validatedData.lastName,
+          phone: validatedData.phone,
+          region: validatedData.region,
+          serviceLocation: validatedData.zone,
+          isActive: true,
+          createdAt: new Date().toISOString()
+        };
+        
+        // Créer l'utilisateur
+        const user = await storage.createUser(userData);
+        
+        // Créer le guide de chasse
+        const guideData = {
+          userId: user.id,
+          firstName: validatedData.firstName,
+          lastName: validatedData.lastName,
+          phone: validatedData.phone,
+          zone: validatedData.zone,
+          region: validatedData.region,
+          idNumber: validatedData.idNumber,
+          photo: validatedData.photo || null,
+          status: 'active',
+          createdAt: new Date().toISOString()
+        };
+        
+        const guide = await db.insert(huntingGuides).values(guideData).returning();
+        
+        // Ajouter une entrée dans l'historique
+        await storage.createHistory({
+          userId: req.user?.id,
+          operation: "create",
+          entityType: "guide",
+          entityId: guide[0].id,
+          details: `Guide de chasse créé: ${guide[0].firstName} ${guide[0].lastName}`
+        });
+        
+        res.status(201).json(guide[0]);
+      } catch (validationError) {
+        console.error("Guide validation error:", validationError);
+        if (validationError instanceof z.ZodError) {
+          return res.status(400).json({ 
+            message: "Erreur de validation des données du guide", 
+            errors: validationError.errors 
+          });
+        }
+        throw validationError;
+      }
+    } catch (error) {
+      console.error("Guide creation error:", error);
+      res.status(500).json({ 
+        message: "Échec de la création du guide de chasse",
+        error: error instanceof Error ? error.message : "Erreur inconnue"
+      });
+    }
+  });
+  
+  app.get("/api/guides", async (req, res) => {
+    try {
+      const guides = await db.select().from(huntingGuides);
+      res.json(guides);
+    } catch (error) {
+      console.error("Error fetching hunting guides:", error);
+      res.status(500).json({ message: "Erreur lors de la récupération des guides de chasse" });
+    }
+  });
+
+  // Routes pour la gestion des taxes d'abattage
+  app.get("/api/taxes", isAuthenticated, async (req, res) => {
+    try {
+      const allTaxes = await db.select().from(taxes).orderBy(desc(taxes.issueDate));
+      res.json(allTaxes);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des taxes d'abattage:", error);
+      res.status(500).json({ message: "Erreur serveur lors de la récupération des taxes" });
+    }
+  });
+
+  app.post("/api/taxes", isAuthenticated, async (req, res) => {
+    try {
+      const taxData = insertTaxSchema.parse(req.body);
+      
+      // Ajouter l'ID de l'agent qui crée la taxe
+      const agentId = req.user?.id;
+      
+      const newTax = {
+        ...taxData,
+        createdBy: agentId,
+        createdAt: new Date(),
+      };
+      
+      const result = await db.insert(taxes).values(newTax).returning();
+      
+      // Ajouter une entrée dans l'historique
+      await db.insert(history).values({
+        action: "create",
+        resourceType: "tax",
+        resourceId: result[0].id.toString(),
+        description: `Taxe d'abattage ${result[0].taxNumber} créée`,
+        userId: agentId,
+        timestamp: new Date()
+      });
+      
+      res.status(201).json(result[0]);
+    } catch (error) {
+      console.error("Erreur lors de la création d'une taxe d'abattage:", error);
+      res.status(400).json({ 
+        message: "Erreur lors de la création de la taxe d'abattage", 
+        error: error instanceof Error ? error.message : "Erreur inconnue" 
+      });
+    }
+  });
+
+  app.get("/api/taxes/:id", isAuthenticated, async (req, res) => {
+    try {
+      const taxId = parseInt(req.params.id);
+      if (isNaN(taxId)) {
+        return res.status(400).json({ message: "ID de taxe invalide" });
+      }
+      
+      const tax = await db.select().from(taxes).where(eq(taxes.id, taxId)).limit(1);
+      
+      if (tax.length === 0) {
+        return res.status(404).json({ message: "Taxe non trouvée" });
+      }
+      
+      res.json(tax[0]);
+    } catch (error) {
+      console.error("Erreur lors de la récupération d'une taxe:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.get("/api/taxes/hunter/:hunterId", isAuthenticated, async (req, res) => {
+    try {
+      const hunterId = parseInt(req.params.hunterId);
+      if (isNaN(hunterId)) {
+        return res.status(400).json({ message: "ID de chasseur invalide" });
+      }
+      
+      const hunterTaxes = await db.select().from(taxes).where(eq(taxes.hunterId, hunterId)).orderBy(desc(taxes.issueDate));
+      res.json(hunterTaxes);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des taxes d'un chasseur:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.get("/api/taxes/permit/:permitId", isAuthenticated, async (req, res) => {
+    try {
+      const permitId = parseInt(req.params.permitId);
+      if (isNaN(permitId)) {
+        return res.status(400).json({ message: "ID de permis invalide" });
+      }
+      
+      const permitTaxes = await db.select().from(taxes).where(eq(taxes.permitId, permitId)).orderBy(desc(taxes.issueDate));
+      res.json(permitTaxes);
+    } catch (error) {
+      console.error("Erreur lors de la récupération des taxes d'un permis:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  app.put("/api/taxes/:id", isAuthenticated, async (req, res) => {
+    try {
+      const taxId = parseInt(req.params.id);
+      if (isNaN(taxId)) {
+        return res.status(400).json({ message: "ID de taxe invalide" });
+      }
+      
+      const taxData = insertTaxSchema.parse(req.body);
+      
+      // Vérifier que la taxe existe
+      const existingTax = await db.select().from(taxes).where(eq(taxes.id, taxId)).limit(1);
+      if (existingTax.length === 0) {
+        return res.status(404).json({ message: "Taxe non trouvée" });
+      }
+      
+      // Mettre à jour la taxe
+      const updatedTax = {
+        ...taxData,
+        updatedBy: req.user?.id,
+        updatedAt: new Date(),
+      };
+      
+      const result = await db.update(taxes).set(updatedTax).where(eq(taxes.id, taxId)).returning();
+      
+      // Ajouter une entrée dans l'historique
+      await db.insert(history).values({
+        action: "update",
+        resourceType: "tax",
+        resourceId: taxId.toString(),
+        description: `Taxe d'abattage ${existingTax[0].taxNumber} mise à jour`,
+        userId: req.user?.id,
+        timestamp: new Date()
+      });
+      
+      res.json(result[0]);
+    } catch (error) {
+      console.error("Erreur lors de la mise à jour d'une taxe:", error);
+      res.status(400).json({ 
+        message: "Erreur lors de la mise à jour de la taxe", 
+        error: error instanceof Error ? error.message : "Erreur inconnue" 
+      });
+    }
+  });
+
+  app.delete("/api/taxes/:id", isAuthenticated, async (req, res) => {
+    try {
+      const taxId = parseInt(req.params.id);
+      if (isNaN(taxId)) {
+        return res.status(400).json({ message: "ID de taxe invalide" });
+      }
+      
+      // Vérifier que la taxe existe
+      const existingTax = await db.select().from(taxes).where(eq(taxes.id, taxId)).limit(1);
+      if (existingTax.length === 0) {
+        return res.status(404).json({ message: "Taxe non trouvée" });
+      }
+      
+      // Supprimer la taxe
+      await db.delete(taxes).where(eq(taxes.id, taxId));
+      
+      // Ajouter une entrée dans l'historique
+      await db.insert(history).values({
+        action: "delete",
+        resourceType: "tax",
+        resourceId: taxId.toString(),
+        description: `Taxe d'abattage ${existingTax[0].taxNumber} supprimée`,
+        userId: req.user?.id,
+        timestamp: new Date()
+      });
+      
+      res.status(204).end();
+    } catch (error) {
+      console.error("Erreur lors de la suppression d'une taxe:", error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  });
+
+  // Return the HTTP server
+  return createServer(app);
+}

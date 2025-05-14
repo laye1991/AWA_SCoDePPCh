@@ -1,0 +1,132 @@
+/* Import des polices Material Icons */
+@import url('https://fonts.googleapis.com/icon?family=Material+Icons');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@media print {
+  .no-print, .no-print * {
+    display: none !important;
+  }
+  
+  .print-only {
+    display: block !important;
+  }
+  
+  .hidden-print {
+    display: none !important;
+  }
+  
+  body {
+    background: white !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  
+  /* Format pour impression du permis */
+  .printable-table {
+    width: 100%;
+    border: none !important;
+    box-shadow: none !important;
+  }
+}
+
+@media screen {
+  .print-only {
+    display: none !important;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-gray-50 text-foreground;
+  }
+  
+  /* Masquer les éléments spécifiques */
+  [data-component-name="_c"] {
+    display: none !important;
+  }
+  
+  /* Masquer également les cartes d'activité récente */
+  div[class*="col-span-4"][data-component-name="_c"] {
+    display: none !important;
+  }
+  
+  /* Masquer les barres de défilement pour tous les éléments par défaut */
+  /* Pour Firefox */
+  * {
+    scrollbar-width: none;
+  }
+  
+  /* Pour Chrome, Safari, et Opera */
+  *::-webkit-scrollbar {
+    display: none;
+  }
+  
+  /* Afficher la barre de défilement pour la zone principale seulement */
+  .main-content-area {
+    scrollbar-width: thin;
+  }
+  
+  .main-content-area::-webkit-scrollbar {
+    display: block;
+    width: 8px;
+  }
+  
+  .main-content-area::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+  }
+  
+  .main-content-area::-webkit-scrollbar-thumb {
+    background: #008542;
+    border-radius: 4px;
+  }
+  
+  .main-content-area::-webkit-scrollbar-thumb:hover {
+    background: #006b36;
+  }
+}
+
+/* Couleurs personnalisées inspirées du design sénégalais */
+:root {
+  --primary-green: #006400;
+  --primary-green-hover: #008000;
+  --secondary-green: #004d00;
+  --light-green: #e6ffe6;
+  --accent-yellow: #ffcb05;
+  --accent-red: #cc0000;
+}
+
+.bg-primary-custom {
+  background-color: var(--primary-green);
+}
+
+.bg-primary-hover {
+  background-color: var(--primary-green-hover);
+}
+
+.text-primary-custom {
+  color: var(--primary-green);
+}
+
+.border-primary-custom {
+  border-color: var(--primary-green);
+}
+
+.bg-light-green {
+  background-color: var(--light-green);
+}
+
+.bg-accent-yellow {
+  background-color: var(--accent-yellow);
+}
+
+.text-accent-red {
+  color: var(--accent-red);
+}
